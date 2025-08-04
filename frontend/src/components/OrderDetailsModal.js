@@ -321,7 +321,7 @@ const OrderDetailsModal = ({ open, onClose, order, user }) => {
                   },
                 }}
               >
-                {availableTrucks.map((truck) => (
+                {availableTrucks.sort().map((truck) => (
                   <MenuItem key={truck} value={truck}>
                     <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
                       <TruckIcon fontSize="small" />

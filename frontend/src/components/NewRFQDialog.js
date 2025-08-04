@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Dialog, DialogTitle, DialogContent, DialogActions, Button, TextField, MenuItem, Alert, Box, Radio, RadioGroup, FormControlLabel, IconButton, Typography, Divider, Checkbox, FormControlLabel as MuiFormControlLabel, Card, CardContent, Grid, Tooltip, Chip } from '@mui/material';
 import AddCircleOutlineIcon from '@mui/icons-material/AddCircleOutline';
 import CloseIcon from '@mui/icons-material/Close';
@@ -17,20 +17,12 @@ import axios from 'axios';
 const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
   const [materialType, setMaterialType] = useState('');
   const [materialWeight, setMaterialWeight] = useState('');
-  const [weightUnit, setWeightUnit] = useState('Number of items');
+  const [selectedCategories, setSelectedCategories] = useState([]);
   const [invoiceAmount, setInvoiceAmount] = useState('');
-  const [sgst, setSgst] = useState('');
-  const [cgst, setCgst] = useState('');
-  const [tariffHsn, setTariffHsn] = useState('');
   const [vehicleHeight, setVehicleHeight] = useState('');
   const [vehicleHeightOption, setVehicleHeightOption] = useState('');
   const [toll, setToll] = useState('');
-  const [haltingDays, setHaltingDays] = useState('');
-  const [haltingCharge, setHaltingCharge] = useState('');
-  const [extraPointPickup, setExtraPointPickup] = useState('');
-  const [poRate, setPoRate] = useState('');
   const [actualPayable, setActualPayable] = useState('');
-  const [debitNote, setDebitNote] = useState('');
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
   const [loading, setLoading] = useState(false);
@@ -43,9 +35,35 @@ const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
   
   // Multiple trip state - stages
   const [tripStages, setTripStages] = useState([
-    { id: 1, source: '', destination: '', sequence: 1 }
+    { 
+      id: 1, 
+      source: '', 
+      destination: '', 
+      sequence: 1,
+      // Material Details for each stage
+      materialType: '',
+      materialWeight: '',
+      selectedCategories: [],
+      // Cost Breakdown for each stage
+      invoiceAmount: '',
+      vehicleHeightOption: '',
+      toll: '',
+      totalAmount: '',
+      shippedByVendor: false,
+      autoPopulationMessage: ''
+    }
   ]);
   
+  // Multiple trip totals
+  const [multipleTripTotals, setMultipleTripTotals] = useState({
+    totalInvoiceValue: 0,
+    totalToll: 0,
+    finalTotalAmount: 0
+  });
+  
+  // Ref to track last weight values to prevent unnecessary API calls
+  const lastWeightValues = useRef({});
+  const lastRateCall = useRef({});
   const [truckSuggestions, setTruckSuggestions] = useState([]);
   const [selectedTruckSuggestion, setSelectedTruckSuggestion] = useState(null);
   const [useManualTrucks, setUseManualTrucks] = useState(false);
@@ -57,6 +75,11 @@ const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
   const [additionalManualTrucks, setAdditionalManualTrucks] = useState('');
   const [etaTimeUnit, setEtaTimeUnit] = useState('hours');
   const [etaValue, setEtaValue] = useState('');
+  const [shippedByVendor, setShippedByVendor] = useState(false);
+  const [autoPopulationMessage, setAutoPopulationMessage] = useState('');
+  const [loadingStages, setLoadingStages] = useState(new Set());
+  const [requiresSecondVehicle, setRequiresSecondVehicle] = useState(false);
+  const [remainingWeight, setRemainingWeight] = useState(0);
 
   // Custom factory options
   const customFactories = [
@@ -64,75 +87,116 @@ const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
     "Soliflex Packaging-1", "Soliflex Packaging-2", "Soliflex Packaging-3", "Soliflex Packaging-4"
   ];
 
-  // Vehicle height options
-  const vehicleHeightOptions = ['> 6 MT', '> 10 MT'];
+  // Vehicle capacity options
+  const vehicleCapacityOptions = ['0 -> 3 tons', '3 -> 6 tons', 'Above 6 tons'];
 
-  // Calculate SGST and CGST when invoice amount changes
+  // Category options
+  const categoryOptions = ['Rolls', 'Wastage', 'Raw Materials'];
+
+  // Function to get vendor rates from backend
+  const getVendorRates = async (vendorName, weight, isShippedByVendor) => {
+    try {
+      console.log('Sending vendor rates request:', { vendorName, weight, isShippedByVendor });
+      const response = await axios.post('/api/vendor-rates', {
+        vendorName,
+        weight,
+        isShippedByVendor
+      });
+      return response.data;
+    } catch (error) {
+      console.error('Error fetching vendor rates:', error);
+      console.error('Error response data:', error.response?.data);
+      // If the error response contains allowManualEntry data, return it
+      if (error.response && error.response.data) {
+        return error.response.data;
+      }
+      // Otherwise return a default error response
+      return { 
+        allowManualEntry: true, 
+        message: 'Failed to fetch vendor rates. Please enter the invoice amount manually.',
+        rate: 0, 
+        tollCharges: 0 
+      };
+    }
+  };
+
+
+
+  // Total Amount is calculated by backend as Invoice Amount + Toll Charges
+  // No frontend calculation needed - backend provides the correct total
+
+  // Auto-populate vehicle capacity based on weight
   useEffect(() => {
-    if (invoiceAmount && !isNaN(invoiceAmount)) {
-      const amount = parseFloat(invoiceAmount);
-      const taxAmount = amount * 0.025; // 2.5%
-      setSgst(taxAmount.toFixed(2));
-      setCgst(taxAmount.toFixed(2));
+    if (materialWeight && !isNaN(materialWeight)) {
+      const weight = parseFloat(materialWeight);
+      
+      if (weight < 3000) {
+        setVehicleHeightOption('0 -> 3 tons');
+      } else if (weight >= 3000 && weight < 6000) {
+        setVehicleHeightOption('3 -> 6 tons');
+      } else if (weight >= 6000) {
+        setVehicleHeightOption('Above 6 tons');
+      }
+    }
+  }, [materialWeight]);
+
+  // Auto-populate invoice amount and toll charges based on vendor rates
+  useEffect(() => {
+    const populateRates = async () => {
+      if (sourceFactory && materialWeight && !isNaN(materialWeight)) {
+        const weight = parseFloat(materialWeight);
+        try {
+          const response = await getVendorRates(sourceFactory, weight, shippedByVendor);
+          
+          if (response.allowManualEntry) {
+            // Show message that auto-population is not available
+            setInvoiceAmount('');
+            setToll('');
+            setActualPayable('');
+            setAutoPopulationMessage(response.message);
+          } else {
+            // Safely convert values to strings, handling undefined/null values
+            setInvoiceAmount(response.rate ? response.rate.toString() : '');
+            setToll(response.tollCharges ? response.tollCharges.toString() : '');
+            setActualPayable(response.totalAmount ? response.totalAmount.toString() : '');
+            setAutoPopulationMessage('');
+          }
+        } catch (error) {
+          console.error('Error populating rates:', error);
+          setInvoiceAmount('');
+          setToll('');
+          setActualPayable('');
+          setAutoPopulationMessage('Error fetching vendor rates. Please enter values manually.');
+        }
+      }
+    };
+    
+    populateRates();
+  }, [sourceFactory, materialWeight, shippedByVendor]);
+
+  // Handle category selection
+  const handleCategoryChange = (category) => {
+    setSelectedCategories(prev => {
+      if (prev.includes(category)) {
+        return prev.filter(cat => cat !== category);
     } else {
-      setSgst('');
-      setCgst('');
+        return [...prev, category];
     }
-  }, [invoiceAmount]);
-
-  // Calculate Actual Payable when relevant fields change
-  useEffect(() => {
-    let total = 0;
-    
-    // Vehicle height base amount
-    if (vehicleHeight && parseFloat(vehicleHeight) >= 19) {
-      total += 300; // Default amount for 19 & above
-    }
-    
-    // Vehicle height option amounts
-    if (vehicleHeightOption === '>6 MT') {
-      total += 1000;
-    } else if (vehicleHeightOption === '>10 MT') {
-      total += 1500;
-    }
-    
-    // Add other amounts
-    if (toll && !isNaN(toll)) total += parseFloat(toll);
-    if (haltingDays && haltingCharge && !isNaN(haltingDays) && !isNaN(haltingCharge)) {
-      total += parseFloat(haltingDays) * parseFloat(haltingCharge);
-    }
-    if (extraPointPickup && !isNaN(extraPointPickup)) total += parseFloat(extraPointPickup);
-    if (poRate && !isNaN(poRate)) total += parseFloat(poRate);
-    
-    setActualPayable(total.toFixed(2));
-  }, [vehicleHeight, vehicleHeightOption, toll, haltingDays, haltingCharge, extraPointPickup, poRate]);
-
-  // Calculate Debit Note when invoice amount or actual payable changes
-  useEffect(() => {
-    if (invoiceAmount && actualPayable && !isNaN(invoiceAmount) && !isNaN(actualPayable)) {
-      const difference = parseFloat(invoiceAmount) - parseFloat(actualPayable);
-      setDebitNote(difference.toFixed(2));
-    } else {
-      setDebitNote('');
-    }
-  }, [invoiceAmount, actualPayable]);
+    });
+  };
 
   useEffect(() => {
     if (open) {
-      // Get vendor places from API and combine with custom factories
+      // Get vendor places from API (now includes custom factories from backend)
       axios.get('/api/vendor-places')
         .then(res => {
-          const apiVendors = res.data || [];
-          const allVendors = [
-            ...apiVendors,
-            ...customFactories.map((factory, index) => ({
-              vendor_place_name: factory,
-              id: `custom_${index + 1}`
-            }))
-          ];
+          const allVendors = res.data || [];
+          console.log('Vendor places loaded:', allVendors.length, 'vendors');
+          console.log('Sample vendor data:', allVendors.slice(0, 3));
           setVendorPlaces(allVendors);
         })
-        .catch(() => {
+        .catch((error) => {
+          console.error('Error fetching vendor places:', error);
           // Fallback to just custom factories if API fails
           setVendorPlaces(customFactories.map((factory, index) => ({
             vendor_place_name: factory,
@@ -142,14 +206,22 @@ const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
     }
   }, [open]);
 
+  // Single trip truck suggestions with proper debouncing
   useEffect(() => {
-    // Get truck suggestions when materialWeight changes
-    if (materialWeight && !isNaN(materialWeight) && Number(materialWeight) > 0 && !useManualTrucks) {
+    if (transportType === 'single' && materialWeight && !isNaN(materialWeight) && Number(materialWeight) > 0 && !useManualTrucks) {
       const weight = Number(materialWeight);
+      const weightKey = `${weight}-${selectedCategories.join(',')}`;
+      
+      // Check if we already have suggestions for this weight/category combination
+      if (lastWeightValues.current.single === weightKey) {
+        return;
+      }
+      
       setTruckLoading(true);
+      lastWeightValues.current.single = weightKey;
       
       // For wastage, use different logic - find closest vehicle without utilization restriction
-      if (weightUnit === 'Wastage') {
+      if (selectedCategories.includes('Wastage')) {
         axios.post('/api/trucks/suggest-wastage', { weight })
           .then(res => {
             setTruckSuggestions(res.data.suggestions || []);
@@ -170,7 +242,7 @@ const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
             // First try: Find single vehicle with 100% utilization (exact match)
             let response = await axios.post('/api/trucks/suggest', { 
               weight, 
-              weight_unit: weightUnit,
+              weight_unit: selectedCategories.join(', '),
               min_utilization: 100,
               max_utilization: 100
             });
@@ -185,7 +257,7 @@ const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
             // Second try: Find single vehicle with 95-99% utilization
             response = await axios.post('/api/trucks/suggest', { 
               weight, 
-              weight_unit: weightUnit,
+              weight_unit: selectedCategories.join(', '),
               min_utilization: 95,
               max_utilization: 99
             });
@@ -200,7 +272,7 @@ const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
             // Third try: Find single vehicle with 90-94% utilization
             response = await axios.post('/api/trucks/suggest', { 
               weight, 
-              weight_unit: weightUnit,
+              weight_unit: selectedCategories.join(', '),
               min_utilization: 90,
               max_utilization: 94
             });
@@ -215,7 +287,7 @@ const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
             // Fourth try: Find single vehicle with 85-89% utilization
             response = await axios.post('/api/trucks/suggest', { 
               weight, 
-              weight_unit: weightUnit,
+              weight_unit: selectedCategories.join(', '),
               min_utilization: 85,
               max_utilization: 89
             });
@@ -230,7 +302,7 @@ const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
             // Fifth try: Find single vehicle with 80-84% utilization
             response = await axios.post('/api/trucks/suggest', { 
               weight, 
-              weight_unit: weightUnit,
+              weight_unit: selectedCategories.join(', '),
               min_utilization: 80,
               max_utilization: 84
             });
@@ -245,7 +317,7 @@ const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
             // Sixth try: Find single vehicle with 75-79% utilization
             response = await axios.post('/api/trucks/suggest', { 
               weight, 
-              weight_unit: weightUnit,
+              weight_unit: selectedCategories.join(', '),
               min_utilization: 75,
               max_utilization: 79
             });
@@ -260,7 +332,7 @@ const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
             // Seventh try: Find single vehicle with 70-74% utilization (minimum acceptable)
             response = await axios.post('/api/trucks/suggest', { 
               weight, 
-              weight_unit: weightUnit,
+              weight_unit: selectedCategories.join(', '),
               min_utilization: 70,
               max_utilization: 74
             });
@@ -275,7 +347,7 @@ const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
             // If no single vehicle found with 70%+ utilization, try combination approach
             response = await axios.post('/api/trucks/suggest-combination', { 
               weight, 
-              weight_unit: weightUnit,
+              weight_unit: selectedCategories.join(', '),
               min_utilization: 70,
               max_utilization: 100
             });
@@ -303,7 +375,7 @@ const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
             // If no combination found, find the best single vehicle (even if below 70%)
             response = await axios.post('/api/trucks/suggest', { 
               weight, 
-              weight_unit: weightUnit,
+              weight_unit: selectedCategories.join(', '),
               min_utilization: 0,
               max_utilization: 100
             });
@@ -336,32 +408,119 @@ const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
         
         getTruckSuggestions();
       }
-    } else {
+    } else if (transportType === 'single') {
       setTruckSuggestions([]);
       setSelectedTruckSuggestion(null);
     }
-  }, [materialWeight, weightUnit, useManualTrucks]);
+  }, [materialWeight, selectedCategories, useManualTrucks, transportType]);
+
+  // Multiple trip truck suggestions with proper debouncing
+  useEffect(() => {
+    if (transportType === 'multiple' && !useManualTrucks) {
+      // Calculate total weight from all stages
+      const totalWeight = calculateTotalWeight();
+      
+      if (totalWeight > 0) {
+        // Get all categories from all stages
+        const allCategories = new Set();
+        tripStages.forEach(stage => {
+          if (stage.selectedCategories && stage.selectedCategories.length > 0) {
+            stage.selectedCategories.forEach(cat => allCategories.add(cat));
+          }
+        });
+        const categories = Array.from(allCategories);
+        
+        const weightKey = `multiple-total-${totalWeight}-${categories.join(',')}`;
+        
+        console.log('Multiple trip truck suggestions - Total weight:', totalWeight, 'Categories:', categories);
+        
+        // Check if we already have suggestions for this weight/category combination
+        if (lastWeightValues.current.multiple === weightKey) {
+          return;
+        }
+        
+        setTruckLoading(true);
+        lastWeightValues.current.multiple = weightKey;
+        
+        // For wastage, use different logic - find closest vehicle without utilization restriction
+        if (categories.includes('Wastage')) {
+          axios.post('/api/trucks/suggest-wastage', { weight: totalWeight })
+            .then(res => {
+              console.log('Wastage truck suggestions:', res.data);
+              setTruckSuggestions(res.data.suggestions || []);
+              setSelectedTruckSuggestion(res.data.suggestions && res.data.suggestions.length > 0 ? res.data.suggestions[0] : null);
+            })
+            .catch(err => {
+              console.error('Error fetching truck suggestions for wastage:', err);
+              setTruckSuggestions([]);
+              setSelectedTruckSuggestion(null);
+            })
+            .finally(() => {
+              setTruckLoading(false);
+            });
+        } else {
+          // Use the new total weight-based truck suggestion logic
+          getTruckSuggestionsForTotalWeight(totalWeight, categories)
+            .then(result => {
+              console.log('Total weight truck suggestions result:', result);
+              setTruckSuggestions(result.suggestions);
+              setSelectedTruckSuggestion(result.selected);
+              
+              // If second vehicle is required, show message and set states
+              if (result.requiresSecondVehicle) {
+                setRequiresSecondVehicle(true);
+                setRemainingWeight(result.remainingWeight);
+                setError(`First vehicle selected. Please manually enter details for second vehicle to handle ${result.remainingWeight.toFixed(2)} kg remaining weight.`);
+              } else {
+                setRequiresSecondVehicle(false);
+                setRemainingWeight(0);
+                setError(''); // Clear any previous error
+              }
+            })
+            .catch(err => {
+              console.error('Error fetching truck suggestions for multiple trips:', err);
+              setTruckSuggestions([]);
+              setSelectedTruckSuggestion(null);
+            })
+            .finally(() => {
+              setTruckLoading(false);
+            });
+        }
+      } else {
+        setTruckSuggestions([]);
+        setSelectedTruckSuggestion(null);
+      }
+    }
+  }, [tripStages, transportType, useManualTrucks]);
 
   const resetForm = () => {
     setMaterialType('');
     setMaterialWeight('');
-    setWeightUnit('Number of items');
+    setSelectedCategories([]);
     setInvoiceAmount('');
-    setSgst('');
-    setCgst('');
-    setTariffHsn('');
     setVehicleHeight('');
     setVehicleHeightOption('');
     setToll('');
-    setHaltingDays('');
-    setHaltingCharge('');
-    setExtraPointPickup('');
-    setPoRate('');
     setActualPayable('');
-    setDebitNote('');
     setSourceFactory('');
     setDestFactories(['']);
-    setTripStages([{ id: 1, source: '', destination: '', sequence: 1 }]);
+    setTripStages([{ 
+      id: 1, 
+      source: '', 
+      destination: '', 
+      sequence: 1,
+      // Material Details for each stage
+      materialType: '',
+      materialWeight: '',
+      selectedCategories: [],
+      // Cost Breakdown for each stage
+      invoiceAmount: '',
+      vehicleHeightOption: '',
+      toll: '',
+      totalAmount: '',
+      shippedByVendor: false,
+      autoPopulationMessage: ''
+    }]);
     setTransportType('single');
     setTruckSuggestions([]);
     setSelectedTruckSuggestion(null);
@@ -371,6 +530,18 @@ const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
     setAdditionalManualTrucks('');
     setEtaTimeUnit('hours');
     setEtaValue('');
+    setShippedByVendor(false);
+    setAutoPopulationMessage('');
+    setMultipleTripTotals({
+      totalInvoiceValue: 0,
+      totalToll: 0,
+      finalTotalAmount: 0
+    });
+    // Clear the last weight values ref
+    lastWeightValues.current = {};
+    setLoadingStages(new Set());
+    setRequiresSecondVehicle(false);
+    setRemainingWeight(0);
     setError('');
     setSuccess('');
   };
@@ -396,7 +567,18 @@ const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
       id: newId, 
       source: '', 
       destination: '', 
-      sequence: tripStages.length + 1 
+      sequence: tripStages.length + 1,
+      // Material Details for each stage
+      materialType: '',
+      materialWeight: '',
+      selectedCategories: [],
+      // Cost Breakdown for each stage
+      invoiceAmount: '',
+      vehicleHeightOption: '',
+      toll: '',
+      totalAmount: '',
+      shippedByVendor: false,
+      autoPopulationMessage: ''
     }]);
   };
 
@@ -411,11 +593,296 @@ const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
   };
 
   const updateTripStage = (stageId, field, value) => {
-    setTripStages(tripStages.map(stage => 
+    setTripStages(prevStages => 
+      prevStages.map(stage => 
       stage.id === stageId ? { ...stage, [field]: value } : stage
-    ));
+      )
+    );
   };
 
+  // Handle category changes for individual stages
+  const handleStageCategoryChange = (stageId, category) => {
+    setTripStages(tripStages.map(stage => {
+      if (stage.id === stageId) {
+        const currentCategories = stage.selectedCategories || [];
+        const updatedCategories = currentCategories.includes(category)
+          ? currentCategories.filter(c => c !== category)
+          : [...currentCategories, category];
+        return { ...stage, selectedCategories: updatedCategories };
+      }
+      return stage;
+    }));
+  };
+
+  // Populate rates for individual stages
+  const populateStageRates = async (stageId) => {
+    const stage = tripStages.find(s => s.id === stageId);
+    if (!stage || !stage.source || !stage.materialWeight || stage.materialWeight.length === 0) return;
+
+    console.log(`Populating rates for stage ${stageId}:`, { source: stage.source, weight: stage.materialWeight, shippedByVendor: stage.shippedByVendor });
+
+    // Set loading state for this stage
+    setLoadingStages(prev => new Set([...prev, stageId]));
+
+    try {
+      const response = await getVendorRates(stage.source, stage.materialWeight, stage.shippedByVendor);
+      console.log(`Rates response for stage ${stageId}:`, response);
+      
+      if (response.allowManualEntry) {
+        updateTripStage(stageId, 'invoiceAmount', '');
+        updateTripStage(stageId, 'toll', '');
+        updateTripStage(stageId, 'totalAmount', '');
+        updateTripStage(stageId, 'autoPopulationMessage', response.message);
+      } else {
+        updateTripStage(stageId, 'invoiceAmount', response.rate ? response.rate.toString() : '');
+        updateTripStage(stageId, 'toll', response.tollCharges ? response.tollCharges.toString() : '');
+        updateTripStage(stageId, 'totalAmount', response.totalAmount ? response.totalAmount.toString() : '');
+        updateTripStage(stageId, 'autoPopulationMessage', '');
+      }
+    } catch (error) {
+      console.error('Error populating rates for stage:', error);
+      updateTripStage(stageId, 'invoiceAmount', '');
+      updateTripStage(stageId, 'toll', '');
+      updateTripStage(stageId, 'totalAmount', '');
+      updateTripStage(stageId, 'autoPopulationMessage', 'Error fetching vendor rates. Please enter values manually.');
+    } finally {
+      // Clear loading state for this stage
+      setLoadingStages(prev => {
+        const newSet = new Set(prev);
+        newSet.delete(stageId);
+        return newSet;
+      });
+    }
+  };
+
+  // Calculate totals for multiple trips
+  const calculateMultipleTripTotals = () => {
+    const totals = tripStages.reduce((acc, stage) => {
+      const invoiceAmount = parseFloat(stage.invoiceAmount) || 0;
+      const toll = parseFloat(stage.toll) || 0;
+      const totalAmount = parseFloat(stage.totalAmount) || 0;
+      
+      return {
+        totalInvoiceValue: acc.totalInvoiceValue + invoiceAmount,
+        totalToll: acc.totalToll + toll,
+        finalTotalAmount: acc.finalTotalAmount + totalAmount
+      };
+    }, { totalInvoiceValue: 0, totalToll: 0, finalTotalAmount: 0 });
+    
+    setMultipleTripTotals(totals);
+  };
+
+  // Calculate total weight for multiple trips
+  const calculateTotalWeight = () => {
+    return tripStages.reduce((total, stage) => {
+      const weight = parseFloat(stage.materialWeight) || 0;
+      return total + weight;
+    }, 0);
+  };
+
+  // Get truck suggestions for multiple trips based on total weight
+  const getTruckSuggestionsForTotalWeight = async (totalWeight, categories) => {
+    try {
+      // First try: Find single vehicle with 100% utilization (exact match)
+      let response = await axios.post('/api/trucks/suggest', { 
+        weight: totalWeight, 
+        weight_unit: categories.join(', '),
+        min_utilization: 100,
+        max_utilization: 100
+      });
+      
+      if (response.data.suggestions && response.data.suggestions.length > 0) {
+        return {
+          suggestions: response.data.suggestions,
+          selected: response.data.suggestions[0],
+          requiresSecondVehicle: false
+        };
+      }
+      
+      // Second try: Find single vehicle with 90-99% utilization
+      response = await axios.post('/api/trucks/suggest', { 
+        weight: totalWeight, 
+        weight_unit: categories.join(', '),
+        min_utilization: 90,
+        max_utilization: 99
+      });
+      
+      if (response.data.suggestions && response.data.suggestions.length > 0) {
+        return {
+          suggestions: response.data.suggestions,
+          selected: response.data.suggestions[0],
+          requiresSecondVehicle: false
+        };
+      }
+      
+      // Third try: Find single vehicle with 80-89% utilization
+      response = await axios.post('/api/trucks/suggest', { 
+        weight: totalWeight, 
+        weight_unit: categories.join(', '),
+        min_utilization: 80,
+        max_utilization: 89
+      });
+      
+      if (response.data.suggestions && response.data.suggestions.length > 0) {
+        return {
+          suggestions: response.data.suggestions,
+          selected: response.data.suggestions[0],
+          requiresSecondVehicle: false
+        };
+      }
+      
+      // Fourth try: Find single vehicle with 70-79% utilization
+      response = await axios.post('/api/trucks/suggest', { 
+        weight: totalWeight, 
+        weight_unit: categories.join(', '),
+        min_utilization: 70,
+        max_utilization: 79
+      });
+      
+      if (response.data.suggestions && response.data.suggestions.length > 0) {
+        return {
+          suggestions: response.data.suggestions,
+          selected: response.data.suggestions[0],
+          requiresSecondVehicle: false
+        };
+      }
+      
+      // If no single vehicle found with 70%+ utilization, try combination approach
+      response = await axios.post('/api/trucks/suggest-combination', { 
+        weight: totalWeight, 
+        weight_unit: categories.join(', '),
+        min_utilization: 70,
+        max_utilization: 100
+      });
+      
+      if (response.data.suggestions && response.data.suggestions.length > 0) {
+        // Filter out combinations with utilization > 100%
+        let filtered = response.data.suggestions.filter(s => {
+          let util = s.utilization || s.utilization_percentage || s.total_utilization;
+          return util <= 100;
+        });
+        // Sort by utilization descending (closest to 100%)
+        filtered = filtered.sort((a, b) => {
+          let utilA = a.utilization || a.utilization_percentage || a.total_utilization;
+          let utilB = b.utilization || b.utilization_percentage || b.total_utilization;
+          return utilB - utilA;
+        });
+        if (filtered.length > 0) {
+          return {
+            suggestions: filtered,
+            selected: filtered[0],
+            requiresSecondVehicle: false
+          };
+        }
+      }
+      
+      // If no combination found, find the best single vehicle and suggest second vehicle
+      response = await axios.post('/api/trucks/suggest', { 
+        weight: totalWeight, 
+        weight_unit: categories.join(', '),
+        min_utilization: 0,
+        max_utilization: 100
+      });
+      
+      if (response.data.suggestions && response.data.suggestions.length > 0) {
+        const bestVehicle = response.data.suggestions[0];
+        const vehicleCapacity = bestVehicle.capacity || bestVehicle.max_weight || 0;
+        const remainingWeight = totalWeight - vehicleCapacity;
+        
+        // Mark this as requiring additional manual vehicle
+        const suggestionsWithManualFlag = response.data.suggestions.map(suggestion => ({
+          ...suggestion,
+          requiresAdditionalVehicle: true,
+          note: `Additional vehicle needed for ${remainingWeight.toFixed(2)} kg remaining weight`
+        }));
+        
+        return {
+          suggestions: suggestionsWithManualFlag,
+          selected: suggestionsWithManualFlag[0],
+          requiresSecondVehicle: true,
+          remainingWeight: remainingWeight
+        };
+      }
+      
+      // No trucks found at all
+      return {
+        suggestions: [],
+        selected: null,
+        requiresSecondVehicle: false
+      };
+      
+    } catch (err) {
+      console.error('Error fetching truck suggestions for total weight:', err);
+      return {
+        suggestions: [],
+        selected: null,
+        requiresSecondVehicle: false
+      };
+    }
+  };
+
+  // Auto-populate vehicle capacity for individual stages
+  const updateStageVehicleCapacity = (stageId, weight) => {
+    let capacity = '';
+    if (weight < 3000) {
+      capacity = '0 -> 3 tons';
+    } else if (weight >= 3000 && weight < 6000) {
+      capacity = '3 -> 6 tons';
+    } else {
+      capacity = 'Above 6 tons';
+    }
+    updateTripStage(stageId, 'vehicleHeightOption', capacity);
+  };
+
+  // Auto-populate vehicle capacity based on weight for stages
+  useEffect(() => {
+    tripStages.forEach(stage => {
+      if (stage.materialWeight && stage.materialWeight.length > 0) {
+        const weight = parseFloat(stage.materialWeight);
+        if (!isNaN(weight)) {
+          // Always update vehicle capacity when weight changes
+          updateStageVehicleCapacity(stage.id, weight);
+        }
+      }
+    });
+  }, [tripStages]);
+
+  // Populate rates for stages with improved debouncing
+  useEffect(() => {
+    const timeouts = {};
+    
+    tripStages.forEach(stage => {
+      if (stage.source && stage.materialWeight && stage.materialWeight.length > 0) {
+        const weightKey = `${stage.id}-${stage.source}-${stage.materialWeight}-${stage.shippedByVendor}`;
+        
+        // Only make API call if the combination has changed
+        if (lastRateCall.current[stage.id] !== weightKey) {
+          // Clear existing timeout for this stage
+          if (timeouts[stage.id]) {
+            clearTimeout(timeouts[stage.id]);
+          }
+          
+          // Set new timeout with longer debounce for better performance
+          timeouts[stage.id] = setTimeout(() => {
+            lastRateCall.current[stage.id] = weightKey;
+            populateStageRates(stage.id);
+          }, 800); // Reduced to 800ms for better responsiveness
+        }
+      }
+    });
+    
+    // Cleanup function
+    return () => {
+      Object.values(timeouts).forEach(timeout => clearTimeout(timeout));
+    };
+  }, [tripStages]);
+
+  // Calculate multiple trip totals when any stage data changes
+  useEffect(() => {
+    if (transportType === 'multiple') {
+      calculateMultipleTripTotals();
+    }
+  }, [tripStages, transportType]);
 
 
   const handleSubmit = async (e) => {
@@ -423,31 +890,46 @@ const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
     setError('');
     setSuccess('');
     
-    if (!materialType || !materialWeight || !weightUnit) {
-      setError('Material type, weight, and unit are required fields');
-      return;
-    }
-    
-    if (materialType.length > 500) {
-      setError('Material type must be 500 characters or less');
-      return;
-    }
-    
     if (!userId) {
       setError('User not authenticated');
       return;
     }
 
-    // Validate trip stages
+    // Validate based on transport type
     if (transportType === 'multiple') {
-      const invalidStages = tripStages.filter(stage => !stage.source || !stage.destination);
+      const invalidStages = tripStages.filter(stage => 
+        !stage.source || 
+        !stage.destination || 
+        !stage.materialType || 
+        !stage.materialWeight || 
+        stage.selectedCategories.length === 0
+      );
       if (invalidStages.length > 0) {
-        setError('All trip stages must have both source and destination selected');
+        setError('All trip stages must have source, destination, material type, weight, and at least one category selected');
+        return;
+      }
+      
+      // Check material type length for all stages
+      const invalidMaterialType = tripStages.find(stage => 
+        stage.materialType && stage.materialType.length > 500
+      );
+      if (invalidMaterialType) {
+        setError('Material type must be 500 characters or less');
         return;
       }
     } else {
       if (!sourceFactory || !destFactories[0]) {
         setError('Source and destination are required for single trip');
+        return;
+      }
+      
+      if (!materialType || !materialWeight || selectedCategories.length === 0) {
+        setError('Material type, weight, and at least one category are required fields');
+        return;
+      }
+      
+      if (materialType.length > 500) {
+        setError('Material type must be 500 characters or less');
         return;
       }
     }
@@ -464,8 +946,31 @@ const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
         return;
       }
     } else {
-      if (!selectedTruckSuggestion) {
-        setError('Please select a truck suggestion or enable manual truck entry');
+      // More flexible validation for truck suggestions
+      if (!selectedTruckSuggestion && !useManualTrucks) {
+        // For multiple trips, allow submission even without truck suggestions if manual entry is available
+        if (transportType === 'multiple') {
+          // Check if any stage has weight data that would trigger truck suggestions
+          const hasWeightData = tripStages.some(stage => 
+            stage.materialWeight && !isNaN(stage.materialWeight) && Number(stage.materialWeight) > 0
+          );
+          
+          if (hasWeightData && truckSuggestions.length === 0 && !truckLoading) {
+            setError('Please select a truck suggestion, enable manual truck entry, or wait for truck suggestions to load');
+            return;
+          }
+        } else {
+          // For single trip, be more strict
+          if (!selectedTruckSuggestion) {
+            setError('Please select a truck suggestion or enable manual truck entry');
+            return;
+          }
+        }
+      }
+      
+      // Validate second vehicle requirement for multiple trips
+      if (transportType === 'multiple' && requiresSecondVehicle && !additionalManualTrucks.trim()) {
+        setError(`Please enter details for the second vehicle to handle ${remainingWeight.toFixed(2)} kg remaining weight`);
         return;
       }
     }
@@ -474,36 +979,34 @@ const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
     try {
       const orderData = {
         user_id: userId,
-        material_type: materialType,
-        material_weight: materialWeight,
-        weight_unit: weightUnit,
-        invoice_amount: invoiceAmount,
-        sgst,
-        cgst,
-        tariff_hsn: tariffHsn,
-        vehicle_height: vehicleHeight,
-        vehicle_height_option: vehicleHeightOption,
-        toll,
-        halting_days: haltingDays,
-        halting_charge: haltingCharge,
-        extra_point_pickup: extraPointPickup,
-        po_rate: poRate,
-        actual_payable: actualPayable,
-        debit_note: debitNote,
         transport_type: transportType,
         use_manual_trucks: useManualTrucks,
         eta_time_unit: etaTimeUnit,
         eta_value: etaValue
       };
 
+      console.log('Submitting order with transport_type:', transportType);
+
       // Add trip data based on transport type
       if (transportType === 'single') {
+        orderData.material_type = materialType;
+        orderData.material_weight = materialWeight;
+        orderData.weight_unit = selectedCategories.join(', ');
+        orderData.invoice_amount = invoiceAmount;
+        orderData.vehicle_height = vehicleHeight;
+        orderData.vehicle_height_option = vehicleHeightOption;
+        orderData.toll = toll;
+        orderData.actual_payable = actualPayable;
+        orderData.shipped_by_vendor = shippedByVendor;
         orderData.source_factory = sourceFactory;
         orderData.dest_factories = destFactories;
       } else {
         orderData.trip_stages = tripStages;
+        orderData.multiple_trip_totals = multipleTripTotals;
       }
       
+      console.log('Final order data:', orderData);
+
       if (useManualTrucks) {
         orderData.manual_trucks = manualTrucks;
       } else if (useCombinedTrucks) {
@@ -540,6 +1043,15 @@ const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
           const additionalTrucks = additionalManualTrucks.split('\n').map(t => t.trim()).filter(Boolean);
           orderData.trucks = [...orderData.trucks, ...additionalTrucks];
           orderData.is_combination = true;
+        }
+        
+        // For multiple trips, handle second vehicle requirement
+        if (transportType === 'multiple' && requiresSecondVehicle && additionalManualTrucks.trim()) {
+          const secondVehicleTrucks = additionalManualTrucks.split('\n').map(t => t.trim()).filter(Boolean);
+          orderData.trucks = [...orderData.trucks, ...secondVehicleTrucks];
+          orderData.is_combination = true;
+          orderData.requires_second_vehicle = true;
+          orderData.remaining_weight = remainingWeight;
         }
       }
       
@@ -680,8 +1192,8 @@ const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
 
           <Divider sx={{ mb: 2, opacity: 0.3 }} />
 
-          {/* Factory Selection */}
-          {transportType === 'single' ? (
+          {/* Factory Selection - Only show for single trip */}
+          {transportType === 'single' && (
             <Box sx={{ mb: 2 }}>
               <Typography variant="h6" sx={{ fontWeight: 600, mb: 1, color: '#1e293b' }}>
                 Route Details
@@ -716,7 +1228,14 @@ const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
                       },
                     }}
                   >
-                    {vendorPlaces.map(place => (
+                    {vendorPlaces
+                      .filter(place => place && typeof place === 'object' && place.vendor_place_name)
+                      .sort((a, b) => {
+                        const nameA = String(a.vendor_place_name || '');
+                        const nameB = String(b.vendor_place_name || '');
+                        return nameA.localeCompare(nameB);
+                      })
+                      .map(place => (
                       <MenuItem key={place.id || place.vendor_place_name} value={place.vendor_place_name}>
                         {place.vendor_place_name}
                       </MenuItem>
@@ -752,30 +1271,69 @@ const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
                       },
                     }}
                   >
-                    {customFactories.map(factory => (
+                    {customFactories.sort().map(factory => (
                       <MenuItem key={factory} value={factory}>
                         {factory}
                       </MenuItem>
                     ))}
-                    {vendorPlaces.filter(place => !customFactories.includes(place.vendor_place_name)).map(place => (
+                    {vendorPlaces
+                      .filter(place => place && typeof place === 'object' && place.vendor_place_name && !customFactories.includes(place.vendor_place_name))
+                      .sort((a, b) => {
+                        const nameA = String(a.vendor_place_name || '');
+                        const nameB = String(b.vendor_place_name || '');
+                        return nameA.localeCompare(nameB);
+                      })
+                      .map(place => (
                       <MenuItem key={place.id || place.vendor_place_name} value={place.vendor_place_name}>
                         {place.vendor_place_name}
                       </MenuItem>
                     ))}
                   </TextField>
                 </Grid>
+                <Grid item xs={12} md={6} sx={{ minWidth: '250px', display: 'flex', alignItems: 'center' }}>
+                  <FormControlLabel
+                    control={
+                      <Checkbox
+                        checked={shippedByVendor}
+                        onChange={(e) => setShippedByVendor(e.target.checked)}
+                        sx={{
+                          color: '#2563eb',
+                          '&.Mui-checked': {
+                            color: '#2563eb',
+                          },
+                        }}
+                      />
+                    }
+                    label={
+                      <Typography sx={{ fontSize: '0.875rem', color: '#374151', fontWeight: 500 }}>
+                        Shipped by vendor?
+                      </Typography>
+                    }
+                  />
+                </Grid>
               </Grid>
             </Box>
-          ) : (
+          )}
+
+          {/* Multiple Trip Stages */}
+          {transportType === 'multiple' && (
             <Box sx={{ mb: 2 }}>
               <Typography variant="h6" sx={{ fontWeight: 600, mb: 1, color: '#1e293b' }}>
                 Trip Stages
               </Typography>
+              
+              {/* Loading indicator for multiple trip stages */}
+              {truckLoading && (
+                <Alert severity="info" sx={{ mb: 2 }}>
+                  Loading truck suggestions and calculating rates... Please wait.
+                </Alert>
+              )}
+              
               {tripStages.map((stage, index) => (
-                <Card key={stage.id} sx={{ mb: 1, borderRadius: 2, border: '1px solid #e2e8f0', backgroundColor: '#ffffff' }}>
-                  <CardContent sx={{ p: 2 }}>
-                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, mb: 1 }}>
-                      <Typography variant="body1" sx={{ fontWeight: 600, color: '#1e293b', minWidth: 80 }}>
+                <Card key={stage.id} sx={{ mb: 2, borderRadius: 2, border: '1px solid #e2e8f0', backgroundColor: '#ffffff' }}>
+                  <CardContent sx={{ p: 3 }}>
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, mb: 2 }}>
+                      <Typography variant="h6" sx={{ fontWeight: 600, color: '#1e293b', minWidth: 80 }}>
                         Stage {stage.sequence}
                       </Typography>
                       {tripStages.length > 1 && (
@@ -793,6 +1351,12 @@ const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
                         </IconButton>
                       )}
                     </Box>
+                    
+                    {/* Route Details */}
+                    <Box sx={{ mb: 3 }}>
+                      <Typography variant="subtitle1" sx={{ fontWeight: 600, mb: 1, color: '#374151' }}>
+                        Route Details
+                      </Typography>
                     <Grid container spacing={3}>
                       <Grid item xs={12} md={6} sx={{ minWidth: '250px' }}>
                         <TextField
@@ -823,7 +1387,14 @@ const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
                             },
                           }}
                         >
-                          {vendorPlaces.map(place => (
+                            {vendorPlaces
+                              .filter(place => place && typeof place === 'object' && place.vendor_place_name)
+                              .sort((a, b) => {
+                                const nameA = String(a.vendor_place_name || '');
+                                const nameB = String(b.vendor_place_name || '');
+                                return nameA.localeCompare(nameB);
+                              })
+                              .map(place => (
                             <MenuItem key={place.id || place.vendor_place_name} value={place.vendor_place_name}>
                               {place.vendor_place_name}
                             </MenuItem>
@@ -859,57 +1430,61 @@ const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
                             },
                           }}
                         >
-                          {customFactories.map(factory => (
+                            {customFactories.sort().map(factory => (
                             <MenuItem key={factory} value={factory}>
                               {factory}
                             </MenuItem>
                           ))}
-                          {vendorPlaces.filter(place => !customFactories.includes(place.vendor_place_name)).map(place => (
+                            {vendorPlaces
+                              .filter(place => place && typeof place === 'object' && place.vendor_place_name && !customFactories.includes(place.vendor_place_name))
+                              .sort((a, b) => {
+                                const nameA = String(a.vendor_place_name || '');
+                                const nameB = String(b.vendor_place_name || '');
+                                return nameA.localeCompare(nameB);
+                              })
+                              .map(place => (
                             <MenuItem key={place.id || place.vendor_place_name} value={place.vendor_place_name}>
                               {place.vendor_place_name}
                             </MenuItem>
                           ))}
                         </TextField>
                       </Grid>
-                    </Grid>
-                  </CardContent>
-                </Card>
-              ))}
-              <Button
-                startIcon={<AddCircleOutlineIcon />}
-                onClick={addTripStage}
-                variant="outlined"
+                        <Grid item xs={12} md={6} sx={{ minWidth: '250px', display: 'flex', alignItems: 'center' }}>
+                          <FormControlLabel
+                            control={
+                              <Checkbox
+                                checked={stage.shippedByVendor}
+                                onChange={(e) => updateTripStage(stage.id, 'shippedByVendor', e.target.checked)}
                 sx={{ 
-                  mt: 1,
-                  fontSize: '0.875rem',
-                  borderColor: '#2563eb',
                   color: '#2563eb',
-                  '&:hover': {
-                    borderColor: '#1d4ed8',
-                    backgroundColor: '#f8fafc',
-                  }
-                }}
-              >
-                Add Stage
-              </Button>
+                                  '&.Mui-checked': {
+                                    color: '#2563eb',
+                                  },
+                                }}
+                              />
+                            }
+                            label={
+                              <Typography sx={{ fontSize: '0.875rem', color: '#374151', fontWeight: 500 }}>
+                                Shipped by vendor?
+                              </Typography>
+                            }
+                          />
+                        </Grid>
+                      </Grid>
             </Box>
-          )}
-
-          <Divider sx={{ mb: 2, opacity: 0.3 }} />
 
           {/* Material Details */}
-          <Box sx={{ mb: 2 }}>
-            <Typography variant="h6" sx={{ fontWeight: 600, mb: 1, color: '#1e293b' }}>
+                    <Box sx={{ mb: 3 }}>
+                      <Typography variant="subtitle1" sx={{ fontWeight: 600, mb: 1, color: '#374151' }}>
               Material Details
             </Typography>
-            
             <Grid container spacing={3}>
               <Grid item xs={12} md={6} sx={{ minWidth: '250px' }}>
                 <TextField
                   label="Weight *"
                   type="number"
-                  value={materialWeight}
-                  onChange={e => setMaterialWeight(e.target.value)}
+                            value={stage.materialWeight}
+                            onChange={e => updateTripStage(stage.id, 'materialWeight', e.target.value)}
                   fullWidth
                   required
                   sx={{
@@ -930,10 +1505,25 @@ const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
               <Grid item xs={12} md={6} sx={{ minWidth: '250px' }}>
                 <TextField
                   select
-                  label="Unit"
-                  value={weightUnit}
-                  onChange={e => setWeightUnit(e.target.value)}
+                            label="Category *"
+                            value={stage.selectedCategories || []}
+                            onChange={() => {}} // Handle change through custom menu items
                   fullWidth
+                            required
+                            SelectProps={{
+                              multiple: true,
+                              renderValue: (selected) => {
+                                if (selected.length === 0) return '';
+                                return selected.join(', ');
+                              },
+                              MenuProps: {
+                                PaperProps: {
+                                  sx: {
+                                    maxHeight: 200,
+                                  },
+                                },
+                              },
+                            }}
                   sx={{
                     '& .MuiOutlinedInput-root': {
                       borderRadius: 2,
@@ -955,10 +1545,34 @@ const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
                     },
                   }}
                 >
-                  <MenuItem value="Number of items">Number of items</MenuItem>
-                  <MenuItem value="Kilograms">Kilograms</MenuItem>
-                  <MenuItem value="Rolls">Rolls</MenuItem>
-                  <MenuItem value="Wastage">Wastage</MenuItem>
+                            {categoryOptions.map((category) => (
+                              <MenuItem key={category} value={category}>
+                                <MuiFormControlLabel
+                                  control={
+                                    <Checkbox
+                                      checked={(stage.selectedCategories || []).includes(category)}
+                                      onChange={() => handleStageCategoryChange(stage.id, category)}
+                                      onClick={(e) => e.stopPropagation()}
+                                      sx={{
+                                        color: '#2563eb',
+                                        '&.Mui-checked': {
+                                          color: '#2563eb',
+                                        },
+                                      }}
+                                    />
+                                  }
+                                  label={category}
+                                  sx={{
+                                    margin: 0,
+                                    width: '100%',
+                                    '& .MuiFormControlLabel-label': {
+                                      fontSize: '0.875rem',
+                                      color: '#374151',
+                                    },
+                                  }}
+                                />
+                              </MenuItem>
+                            ))}
                 </TextField>
               </Grid>
             </Grid>
@@ -967,11 +1581,11 @@ const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
               <Grid item xs={12} md={6} sx={{ minWidth: '250px' }}>
                 <TextField
                   label="Material Type *"
-                  value={materialType}
+                            value={stage.materialType}
                   onChange={e => {
                     const value = e.target.value;
                     if (value.length <= 500) {
-                      setMaterialType(value);
+                                updateTripStage(stage.id, 'materialType', value);
                     }
                   }}
                   fullWidth
@@ -979,7 +1593,7 @@ const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
                   inputProps={{
                     maxLength: 500
                   }}
-                  helperText={`${materialType.length}/500 characters`}
+                            helperText={`${(stage.materialType || '').length}/500 characters`}
                   sx={{
                     '& .MuiOutlinedInput-root': {
                       borderRadius: 2,
@@ -994,7 +1608,7 @@ const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
                     },
                     '& .MuiFormHelperText-root': {
                       fontSize: '0.75rem',
-                      color: materialType.length >= 450 ? '#f59e0b' : '#64748b',
+                                color: (stage.materialType || '').length >= 450 ? '#f59e0b' : '#64748b',
                     },
                   }}
                 />
@@ -1005,13 +1619,23 @@ const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
             </Grid>
           </Box>
 
-          <Divider sx={{ mb: 4, opacity: 0.3 }} />
-
-          {/* Cost Details */}
-          <Box sx={{ mb: 4 }}>
-            <Typography variant="h6" sx={{ fontWeight: 600, mb: 2, color: '#1e293b' }}>
+                    {/* Cost Breakdown */}
+                    <Box sx={{ mb: 2 }}>
+                      <Typography variant="subtitle1" sx={{ fontWeight: 600, mb: 2, color: '#374151' }}>
               Cost Breakdown
             </Typography>
+                      
+                      {loadingStages.has(stage.id) && (
+                        <Alert severity="info" sx={{ mb: 2 }}>
+                          Calculating rates for this stage... Please wait.
+                        </Alert>
+                      )}
+                      
+                      {stage.autoPopulationMessage && (
+                        <Alert severity="info" sx={{ mb: 2 }}>
+                          {stage.autoPopulationMessage}
+                        </Alert>
+                      )}
             
             <Grid container spacing={3}>
               {/* Left Column */}
@@ -1021,31 +1645,8 @@ const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
                     <TextField
                       label="Invoice Amount"
                       type="number"
-                      value={invoiceAmount}
-                      onChange={e => setInvoiceAmount(e.target.value)}
-                      sx={{
-                        width: '100%',
-                        minWidth: '100%',
-                        '& .MuiOutlinedInput-root': {
-                          borderRadius: 2,
-                          fontSize: '0.875rem',
-                          width: '100%',
-                        },
-                        '& .MuiInputBase-root': {
-                          width: '100%',
-                        },
-                        '& .MuiInputLabel-root': {
-                          fontSize: '0.875rem',
-                          color: '#64748b',
-                        },
-                      }}
-                    />
-                  </Grid>
-                  <Grid item xs={12}>
-                    <TextField
-                      label="Tariff / HSN Code"
-                      value={tariffHsn}
-                      onChange={e => setTariffHsn(e.target.value)}
+                                value={stage.invoiceAmount}
+                                onChange={e => updateTripStage(stage.id, 'invoiceAmount', e.target.value)}
                       sx={{
                         width: '100%',
                         minWidth: '100%',
@@ -1067,9 +1668,9 @@ const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
                   <Grid item xs={12}>
                     <TextField
                       select
-                      label="Vehicle Height"
-                      value={vehicleHeightOption}
-                                              onChange={e => setVehicleHeightOption(e.target.value)}
+                                label="Vehicle Capacity"
+                                value={stage.vehicleHeightOption}
+                                onChange={e => updateTripStage(stage.id, 'vehicleHeightOption', e.target.value)}
                       sx={{
                         width: '100%',
                         minWidth: '215px',
@@ -1086,20 +1687,19 @@ const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
                         },
                       }}
                     >
-                      {vehicleHeightOptions.map(option => (
+                                {vehicleCapacityOptions.map(option => (
                         <MenuItem key={option} value={option}>
                           {option}
                         </MenuItem>
                       ))}
                     </TextField>
-
                   </Grid>
                   <Grid item xs={12}>
                     <TextField
                       label="Toll Charges"
                       type="number"
-                      value={toll}
-                      onChange={e => setToll(e.target.value)}
+                                value={stage.toll}
+                                onChange={e => updateTripStage(stage.id, 'toll', e.target.value)}
                       sx={{
                         width: '100%',
                         minWidth: '100%',
@@ -1118,22 +1718,93 @@ const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
                       }}
                     />
                   </Grid>
+                          </Grid>
+                        </Grid>
+
+                        {/* Right Column */}
+                        <Grid item xs={12} md={6}>
+                          <Grid container spacing={2}>
                   <Grid item xs={12}>
                     <TextField
-                      label="PO Rate"
-                      type="number"
-                      value={poRate}
-                      onChange={e => setPoRate(e.target.value)}
+                                label="Total Amount"
+                                value={stage.totalAmount}
+                                fullWidth
+                                disabled
                       sx={{
-                        width: '100%',
-                        minWidth: '100%',
                         '& .MuiOutlinedInput-root': {
                           borderRadius: 2,
                           fontSize: '0.875rem',
-                          width: '100%',
-                        },
-                        '& .MuiInputBase-root': {
-                          width: '100%',
+                                    backgroundColor: '#f0fdf4',
+                                    color: '#059669',
+                                    fontWeight: 600,
+                                  },
+                                  '& .MuiInputLabel-root': {
+                                    fontSize: '0.875rem',
+                                    color: '#64748b',
+                                  },
+                                }}
+                              />
+                            </Grid>
+                          </Grid>
+                        </Grid>
+                      </Grid>
+                    </Box>
+                  </CardContent>
+                </Card>
+              ))}
+              <Button
+                startIcon={<AddCircleOutlineIcon />}
+                onClick={addTripStage}
+                variant="outlined"
+                sx={{ 
+                  mt: 1,
+                  fontSize: '0.875rem',
+                  borderColor: '#2563eb',
+                  color: '#2563eb',
+                  '&:hover': {
+                    borderColor: '#1d4ed8',
+                    backgroundColor: '#f8fafc',
+                  }
+                }}
+              >
+                Add Stage
+              </Button>
+              
+              {/* Multiple Trip Totals */}
+              {tripStages.length > 0 && (
+                <Card sx={{ mt: 2, borderRadius: 2, border: '2px solid #2563eb', backgroundColor: '#f0f9ff' }}>
+                  <CardContent sx={{ p: 3 }}>
+                    <Typography variant="h6" sx={{ fontWeight: 600, mb: 2, color: '#1e293b', display: 'flex', alignItems: 'center', gap: 1 }}>
+                      <AttachMoneyIcon sx={{ color: '#2563eb' }} />
+                      Multiple Trip Totals
+                    </Typography>
+                    
+                    {/* Total Weight Information */}
+                    <Box sx={{ mb: 2, p: 2, backgroundColor: '#f8fafc', borderRadius: 1, border: '1px solid #e2e8f0' }}>
+                      <Typography variant="subtitle2" sx={{ fontWeight: 600, color: '#374151', mb: 1 }}>
+                        Total Weight: {calculateTotalWeight().toFixed(2)} kg
+                      </Typography>
+                      {requiresSecondVehicle && (
+                        <Alert severity="warning" sx={{ mt: 1 }}>
+                          Second vehicle required for {remainingWeight.toFixed(2)} kg remaining weight
+                        </Alert>
+                      )}
+                    </Box>
+                    
+                    <Grid container spacing={3}>
+                      <Grid item xs={12} md={4}>
+                        <TextField
+                          label="Total Invoice Value"
+                          value={multipleTripTotals.totalInvoiceValue.toFixed(2)}
+                          fullWidth
+                          disabled
+                          sx={{
+                            '& .MuiOutlinedInput-root': {
+                              borderRadius: 2,
+                              fontSize: '0.875rem',
+                              backgroundColor: '#f0fdf4',
+                              color: '#059669',
+                              fontWeight: 600,
                         },
                         '& .MuiInputLabel-root': {
                           fontSize: '0.875rem',
@@ -1142,22 +1813,40 @@ const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
                       }}
                     />
                   </Grid>
-                  <Grid item xs={12}>
+                      <Grid item xs={12} md={4}>
                     <TextField
-                      label="Halting Days"
-                      type="number"
-                      value={haltingDays}
-                      onChange={e => setHaltingDays(e.target.value)}
+                          label="Total Toll"
+                          value={multipleTripTotals.totalToll.toFixed(2)}
+                          fullWidth
+                          disabled
                       sx={{
-                        width: '100%',
-                        minWidth: '100%',
                         '& .MuiOutlinedInput-root': {
                           borderRadius: 2,
                           fontSize: '0.875rem',
-                          width: '100%',
-                        },
-                        '& .MuiInputBase-root': {
-                          width: '100%',
+                              backgroundColor: '#f0fdf4',
+                              color: '#059669',
+                              fontWeight: 600,
+                            },
+                            '& .MuiInputLabel-root': {
+                              fontSize: '0.875rem',
+                              color: '#64748b',
+                            },
+                          }}
+                        />
+                      </Grid>
+                      <Grid item xs={12} md={4}>
+                        <TextField
+                          label="Final Total Amount"
+                          value={multipleTripTotals.finalTotalAmount.toFixed(2)}
+                          fullWidth
+                          disabled
+                          sx={{
+                            '& .MuiOutlinedInput-root': {
+                              borderRadius: 2,
+                              fontSize: '0.875rem',
+                              backgroundColor: '#dcfce7',
+                              color: '#166534',
+                              fontWeight: 700,
                         },
                         '& .MuiInputLabel-root': {
                           fontSize: '0.875rem',
@@ -1166,21 +1855,37 @@ const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
                       }}
                     />
                   </Grid>
-                  <Grid item xs={12}>
+                    </Grid>
+                  </CardContent>
+                </Card>
+              )}
+            </Box>
+          )}
+
+          <Divider sx={{ mb: 2, opacity: 0.3 }} />
+
+          {/* Material Details - Only show for single trip */}
+          {transportType === 'single' && (
+            <Box sx={{ mb: 2 }}>
+              <Typography variant="h6" sx={{ fontWeight: 600, mb: 1, color: '#1e293b' }}>
+                Material Details
+              </Typography>
+              
+              <Grid container spacing={3}>
+                <Grid item xs={12} md={6} sx={{ minWidth: '250px' }}>
                     <TextField
-                      label="Halting Charge per Day"
+                    label="Weight *"
                       type="number"
-                      value={haltingCharge}
-                      onChange={e => setHaltingCharge(e.target.value)}
+                    value={materialWeight}
+                    onChange={e => setMaterialWeight(e.target.value)}
+                    fullWidth
+                    required
                       sx={{
-                        width: '100%',
-                        minWidth: '100%',
                         '& .MuiOutlinedInput-root': {
                           borderRadius: 2,
                           fontSize: '0.875rem',
-                          width: '100%',
-                        },
-                        '& .MuiInputBase-root': {
+                        minHeight: '56px',
+                        minWidth: '200px',
                           width: '100%',
                         },
                         '& .MuiInputLabel-root': {
@@ -1190,47 +1895,159 @@ const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
                       }}
                     />
                   </Grid>
-                  <Grid item xs={12}>
+                <Grid item xs={12} md={6} sx={{ minWidth: '250px' }}>
                     <TextField
-                      label="Extra Point Pickup"
-                      type="number"
-                      value={extraPointPickup}
-                      onChange={e => setExtraPointPickup(e.target.value)}
+                    select
+                    label="Category *"
+                    value={selectedCategories}
+                    onChange={() => {}} // Handle change through custom menu items
+                    fullWidth
+                    required
+                    SelectProps={{
+                      multiple: true,
+                      renderValue: (selected) => {
+                        if (selected.length === 0) return '';
+                        return selected.join(', ');
+                      },
+                      MenuProps: {
+                        PaperProps: {
+                          sx: {
+                            maxHeight: 200,
+                          },
+                        },
+                      },
+                    }}
                       sx={{
-                        width: '100%',
-                        minWidth: '100%',
                         '& .MuiOutlinedInput-root': {
                           borderRadius: 2,
                           fontSize: '0.875rem',
+                        minHeight: '56px',
+                        minWidth: '200px',
                           width: '100%',
                         },
-                        '& .MuiInputBase-root': {
-                          width: '100%',
-                        },
-                        '& .MuiInputLabel-root': {
-                          fontSize: '0.875rem',
-                          color: '#64748b',
-                        },
-                      }}
-                    />
-                  </Grid>
+                      '& .MuiInputLabel-root': {
+                        fontSize: '0.875rem',
+                        color: '#64748b',
+                      },
+                      '& .MuiSelect-select': {
+                        minWidth: '180px',
+                        width: '100%',
+                        textOverflow: 'ellipsis',
+                        whiteSpace: 'nowrap',
+                        overflow: 'hidden',
+                      },
+                    }}
+                  >
+                    {categoryOptions.map((category) => (
+                      <MenuItem key={category} value={category}>
+                        <MuiFormControlLabel
+                          control={
+                            <Checkbox
+                              checked={selectedCategories.includes(category)}
+                              onChange={() => handleCategoryChange(category)}
+                              onClick={(e) => e.stopPropagation()}
+                              sx={{
+                                color: '#2563eb',
+                                '&.Mui-checked': {
+                                  color: '#2563eb',
+                                },
+                              }}
+                            />
+                          }
+                          label={category}
+                          sx={{
+                            margin: 0,
+                            width: '100%',
+                            '& .MuiFormControlLabel-label': {
+                              fontSize: '0.875rem',
+                              color: '#374151',
+                            },
+                          }}
+                        />
+                      </MenuItem>
+                    ))}
+                  </TextField>
                 </Grid>
               </Grid>
+              
+              <Grid container spacing={3} sx={{ mt: 2 }}>
+                <Grid item xs={12} md={6} sx={{ minWidth: '250px' }}>
+                  <TextField
+                    label="Material Type *"
+                    value={materialType}
+                    onChange={e => {
+                      const value = e.target.value;
+                      if (value.length <= 500) {
+                        setMaterialType(value);
+                      }
+                    }}
+                    fullWidth
+                    required
+                    inputProps={{
+                      maxLength: 500
+                    }}
+                    helperText={`${materialType.length}/500 characters`}
+                    sx={{
+                      '& .MuiOutlinedInput-root': {
+                        borderRadius: 2,
+                        fontSize: '0.875rem',
+                        minHeight: '56px',
+                        minWidth: '200px',
+                          width: '100%',
+                        },
+                        '& .MuiInputLabel-root': {
+                          fontSize: '0.875rem',
+                          color: '#64748b',
+                        },
+                      '& .MuiFormHelperText-root': {
+                        fontSize: '0.75rem',
+                        color: materialType.length >= 450 ? '#f59e0b' : '#64748b',
+                      },
+                      }}
+                    />
+                  </Grid>
+                <Grid item xs={12} md={6} sx={{ minWidth: '250px' }}>
+                  <Box sx={{ height: '56px' }} />
+                </Grid>
+              </Grid>
+            </Box>
+          )}
 
-              {/* Right Column */}
+          <Divider sx={{ mb: 2, opacity: 0.3 }} />
+
+          {/* Cost Details - Only show for single trip */}
+          {transportType === 'single' && (
+            <Box sx={{ mb: 4 }}>
+              <Typography variant="h6" sx={{ fontWeight: 600, mb: 2, color: '#1e293b' }}>
+                Cost Breakdown
+              </Typography>
+              
+              {autoPopulationMessage && (
+                <Alert severity="info" sx={{ mb: 2 }}>
+                  {autoPopulationMessage}
+                </Alert>
+              )}
+              
+              <Grid container spacing={3}>
+                {/* Left Column */}
               <Grid item xs={12} md={6}>
                 <Grid container spacing={2}>
                   <Grid item xs={12}>
                     <TextField
-                      label="SGST (2.5%)"
-                      value={sgst}
-                      fullWidth
-                      disabled
+                        label="Invoice Amount"
+                        type="number"
+                        value={invoiceAmount}
+                        onChange={e => setInvoiceAmount(e.target.value)}
                       sx={{
+                          width: '100%',
+                          minWidth: '100%',
                         '& .MuiOutlinedInput-root': {
                           borderRadius: 2,
                           fontSize: '0.875rem',
-                          backgroundColor: '#f1f5f9',
+                            width: '100%',
+                          },
+                          '& .MuiInputBase-root': {
+                            width: '100%',
                         },
                         '& .MuiInputLabel-root': {
                           fontSize: '0.875rem',
@@ -1239,17 +2056,52 @@ const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
                       }}
                     />
                   </Grid>
+
                   <Grid item xs={12}>
                     <TextField
-                      label="CGST (2.5%)"
-                      value={cgst}
-                      fullWidth
-                      disabled
+                        select
+                        label="Vehicle Capacity"
+                        value={vehicleHeightOption}
+                        onChange={e => setVehicleHeightOption(e.target.value)}
                       sx={{
+                          width: '100%',
+                          minWidth: '215px',
+                        '& .MuiOutlinedInput-root': {
+                          borderRadius: 2,
+                            fontSize: '0.875rem'
+                          },
+                          '& .MuiInputBase-root': {
+                            width: '100%',
+                        },
+                        '& .MuiInputLabel-root': {
+                          fontSize: '0.875rem',
+                          color: '#64748b',
+                        },
+                      }}
+                      >
+                        {vehicleCapacityOptions.map(option => (
+                          <MenuItem key={option} value={option}>
+                            {option}
+                          </MenuItem>
+                        ))}
+                      </TextField>
+                  </Grid>
+                  <Grid item xs={12}>
+                    <TextField
+                        label="Toll Charges"
+                        type="number"
+                        value={toll}
+                        onChange={e => setToll(e.target.value)}
+                      sx={{
+                          width: '100%',
+                          minWidth: '100%',
                         '& .MuiOutlinedInput-root': {
                           borderRadius: 2,
                           fontSize: '0.875rem',
-                          backgroundColor: '#f1f5f9',
+                            width: '100%',
+                          },
+                          '& .MuiInputBase-root': {
+                            width: '100%',
                         },
                         '& .MuiInputLabel-root': {
                           fontSize: '0.875rem',
@@ -1258,39 +2110,24 @@ const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
                       }}
                     />
                   </Grid>
-                  <Grid item xs={12}>
-                    <TextField
-                      label="Actual Payable"
-                      value={actualPayable}
-                      fullWidth
-                      disabled
-                      sx={{
-                        '& .MuiOutlinedInput-root': {
-                          borderRadius: 2,
-                          fontSize: '0.875rem',
-                          backgroundColor: '#f0fdf4',
-                          color: '#059669',
-                          fontWeight: 600,
-                        },
-                        '& .MuiInputLabel-root': {
-                          fontSize: '0.875rem',
-                          color: '#64748b',
-                        },
-                      }}
-                    />
                   </Grid>
+                </Grid>
+
+                {/* Right Column */}
+                <Grid item xs={12} md={6}>
+                  <Grid container spacing={2}>
                   <Grid item xs={12}>
                     <TextField
-                      label="Debit Note"
-                      value={debitNote}
+                        label="Total Amount"
+                        value={actualPayable}
                       fullWidth
                       disabled
                       sx={{
                         '& .MuiOutlinedInput-root': {
                           borderRadius: 2,
                           fontSize: '0.875rem',
-                          backgroundColor: '#fef2f2',
-                          color: '#dc2626',
+                            backgroundColor: '#f0fdf4',
+                            color: '#059669',
                           fontWeight: 600,
                         },
                         '& .MuiInputLabel-root': {
@@ -1304,8 +2141,9 @@ const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
               </Grid>
             </Grid>
           </Box>
+          )}
 
-          <Divider sx={{ mb: 2, opacity: 0.3 }} />
+          <Divider sx={{ mb: 4, opacity: 0.3 }} />
 
           {/* Truck Assignment */}
           <Box sx={{ mb: 2 }}>
@@ -1527,8 +2365,8 @@ const NewRFQDialog = ({ open, onClose, onSubmit, userId }) => {
                     },
                   }}
                 >
-                  <MenuItem value="hours">Hours</MenuItem>
                   <MenuItem value="days">Days</MenuItem>
+                  <MenuItem value="hours">Hours</MenuItem>
                 </TextField>
               </Grid>
             </Grid>

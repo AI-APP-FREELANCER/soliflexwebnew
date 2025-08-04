@@ -181,7 +181,7 @@ const Register = ({ onRegisterSuccess }) => {
               }
             }}
           >
-            {departments.map(dep => (
+            {departments.sort((a, b) => a.department_name.localeCompare(b.department_name)).map(dep => (
               <MenuItem key={dep.id} value={dep.id}>
                 {dep.department_name}
               </MenuItem>

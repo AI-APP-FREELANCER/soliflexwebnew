@@ -35,7 +35,23 @@ const ORDER_STAGE_FLOW = [
 
 // Helper to load workbook
 function loadWorkbook() {
-  return XLSX.readFile(EXCEL_FILE);
+  try {
+    // Force a fresh read by clearing any potential cache
+    const fs = require('fs');
+    const stats = fs.statSync(EXCEL_FILE);
+    console.log('Excel file stats:', {
+      size: stats.size,
+      modified: stats.mtime,
+      created: stats.birthtime
+    });
+    
+    const workbook = XLSX.readFile(EXCEL_FILE);
+    console.log('Workbook loaded successfully. Available sheets:', Object.keys(workbook.Sheets));
+    return workbook;
+  } catch (error) {
+    console.error('Error loading workbook:', error);
+    throw error;
+  }
 }
 
 // Helper to save workbook
@@ -49,6 +65,21 @@ app.get('/api/departments', (req, res) => {
   const ws = wb.Sheets['department_table'];
   const departments = XLSX.utils.sheet_to_json(ws);
   res.json(departments);
+});
+
+// Get department by ID
+app.get('/api/departments/:id', (req, res) => {
+  const { id } = req.params;
+  const wb = loadWorkbook();
+  const ws = wb.Sheets['department_table'];
+  const departments = XLSX.utils.sheet_to_json(ws);
+  const department = departments.find(d => String(d.id) === String(id));
+  
+  if (!department) {
+    return res.status(404).json({ error: 'Department not found' });
+  }
+  
+  res.json(department);
 });
 
 // Helper to get role from department_id
@@ -153,20 +184,39 @@ function isAdmin(req, res, next) {
 
 // Middleware for purchase or admin check
 function isPurchaseOrAdmin(req, res, next) {
+  console.log('=== isPurchaseOrAdmin middleware ===');
+  console.log('Request body:', req.body);
+  console.log('user_id from body:', req.body.user_id);
+  
   const { user_id } = req.body;
+  if (!user_id) {
+    console.log('No user_id provided in request body');
+    return res.status(400).json({ error: 'user_id is required' });
+  }
+  
   const wb = loadWorkbook();
   const ws = wb.Sheets['user_details'];
   let users = XLSX.utils.sheet_to_json(ws);
   const user = users.find(u => u.id == user_id);
+  
+  console.log('Found user:', user);
+  
   if (!user || (user.role !== 'admin' && user.role !== 'purchase' && user.role !== 'purchase_team')) {
+    console.log('User not found or not authorized. User:', user);
     return res.status(403).json({ error: 'Not authorized to place orders' });
   }
   req.user = user;
+  console.log('User authorized, proceeding to endpoint');
   next();
 }
 
 // Create new order (RFQ)
 app.post('/api/orders', isPurchaseOrAdmin, (req, res) => {
+  try {
+    console.log('=== /api/orders endpoint called ===');
+    console.log('Request body:', JSON.stringify(req.body, null, 2));
+    console.log('User:', req.user);
+  
   const { 
     material_type, 
     material_weight, 
@@ -195,17 +245,52 @@ app.post('/api/orders', isPurchaseOrAdmin, (req, res) => {
     eta_value
   } = req.body;
   
-  if (!material_type || !material_weight || !weight_unit) {
-    return res.status(400).json({ error: 'Material type, weight, and unit are required fields' });
+  // Validate based on transport type
+  console.log('Transport type:', transport_type);
+  console.log('Trip stages:', trip_stages);
+  
+  if (transport_type === 'multiple') {
+    // For multiple trips, validate each stage
+    if (!trip_stages || trip_stages.length === 0) {
+      console.log('Validation failed: No trip stages');
+      return res.status(400).json({ error: 'At least one trip stage is required' });
+    }
+    
+    for (let i = 0; i < trip_stages.length; i++) {
+      const stage = trip_stages[i];
+      console.log(`Stage ${i + 1}:`, stage);
+      if (!stage.materialType || !stage.materialWeight || !stage.selectedCategories || stage.selectedCategories.length === 0) {
+        console.log(`Validation failed for stage ${i + 1}:`, { materialType: stage.materialType, materialWeight: stage.materialWeight, selectedCategories: stage.selectedCategories });
+        return res.status(400).json({ error: `Stage ${i + 1}: Material type, weight, and at least one category are required fields` });
+      }
+    }
+    console.log('Multiple trip validation passed');
+  } else {
+    // For single trip, validate top-level fields
+    console.log('Single trip validation - fields:', { material_type, material_weight, weight_unit });
+    if (!material_type || !material_weight || !weight_unit) {
+      console.log('Validation failed: Missing required fields for single trip');
+      return res.status(400).json({ error: 'Material type, weight, and unit are required fields' });
+    }
+    console.log('Single trip validation passed');
   }
 
+  console.log('Loading workbook...');
   const wb = loadWorkbook();
+  console.log('Workbook loaded successfully');
+  
   const ws = wb.Sheets['order_details'];
+  console.log('Order details sheet found:', !!ws);
+  
   let orders = XLSX.utils.sheet_to_json(ws);
+  console.log('Current orders count:', orders.length);
+  
   const id = orders.length ? Math.max(...orders.map(o => o.id)) + 1 : 1;
   const order_number = `RFQ_ID#${(id).toString().padStart(4, '0')}`;
   const created_by = req.user.id;
   const created_at = new Date().toISOString();
+  
+  console.log('Generated order details:', { id, order_number, created_by, created_at });
 
   // Handle truck assignment
   let assignedTrucks = [];
@@ -312,12 +397,23 @@ app.post('/api/orders', isPurchaseOrAdmin, (req, res) => {
     eta_value
   });
   
+  console.log('Creating new worksheet...');
   const newWs = XLSX.utils.json_to_sheet(orders, { 
     header: ['id', 'order_number', 'material_type', 'material_weight', 'weight_unit', 'invoice_amount', 'sgst', 'cgst', 'tariff_hsn', 'vehicle_height', 'vehicle_height_option', 'toll', 'halting_days', 'halting_charge', 'extra_point_pickup', 'po_rate', 'actual_payable', 'debit_note', 'created_by', 'created_at', 'stages', 'status', 'trucks', 'transport_type', 'source_factory', 'dest_factories', 'trip_stages', 'eta_time_unit', 'eta_value'] 
   });
+  console.log('Worksheet created successfully');
+  
   wb.Sheets['order_details'] = newWs;
+  console.log('Saving workbook...');
   saveWorkbook(wb);
+  console.log('Workbook saved successfully');
+  
+  console.log('Sending success response');
   res.json({ success: true, order_number });
+  } catch (error) {
+    console.error('Error in /api/orders:', error);
+    res.status(500).json({ error: 'Internal server error', details: error.message });
+  }
 });
 
 // Get all orders
@@ -397,71 +493,98 @@ app.post('/api/users/reset-password', (req, res) => {
 
 // Get all vendor places
 app.get('/api/vendor-places', (req, res) => {
-  const wb = loadWorkbook();
-  const ws = wb.Sheets['vendor_places'];
-  if (!ws) return res.status(404).json({ error: 'vendor_places worksheet not found' });
-  const places = XLSX.utils.sheet_to_json(ws);
-  res.json(places);
+  try {
+    const wb = loadWorkbook();
+    
+    // Read from vendor_places sheet and specifically look for "Vendor Place" column
+    const ws = wb.Sheets['vendor_places'];
+    let vendors = [];
+    
+    if (ws) {
+      // Get raw data to access specific columns
+      const rawData = XLSX.utils.sheet_to_json(ws, { header: 1 });
+      if (rawData && rawData.length > 1) {
+        const headers = rawData[0];
+        const vendorPlaceColumnIndex = headers.findIndex(header => 
+          header && header.toString().toLowerCase().includes('vendor place')
+        );
+        
+        console.log('Headers found:', headers);
+        console.log('Vendor Place column index:', vendorPlaceColumnIndex);
+        
+        if (vendorPlaceColumnIndex !== -1) {
+          // Extract vendor names from the "Vendor Place" column
+          vendors = rawData.slice(1) // Skip header row
+            .filter(row => row && row[vendorPlaceColumnIndex] && row[vendorPlaceColumnIndex].toString().trim() !== '')
+            .map((row, index) => ({
+              id: `vendor_${index + 1}`,
+              vendor_place_name: row[vendorPlaceColumnIndex].toString().trim()
+            }));
+        } else {
+          console.log('Vendor Place column not found, trying fallback...');
+          // Fallback to sheet_to_json method
+          const places = XLSX.utils.sheet_to_json(ws);
+          vendors = places.map((place, index) => ({
+            id: place.id || `place_${index + 1}`,
+            vendor_place_name: place['Vendor Place'] || place.vendor_place_name || place.vendor_name || place.name || Object.values(place)[0] || `Place ${index + 1}`
+          }));
+        }
+      }
+    }
+    
+    // Add custom factories to the list
+    const customFactories = [
+      "IndAutoFilters-1", "IndAutoFilters-2", "IndAutoFilters-3", "IndAutoFilters-4",
+      "Soliflex Packaging-1", "Soliflex Packaging-2", "Soliflex Packaging-3", "Soliflex Packaging-4"
+    ];
+    
+    const customFactoryVendors = customFactories.map((factory, index) => ({
+      id: `custom_${index + 1}`,
+      vendor_place_name: factory
+    }));
+    
+    // Combine vendors and custom factories
+    const allVendors = [...vendors, ...customFactoryVendors];
+    
+    console.log('Vendor places API response:', {
+      totalVendors: vendors.length,
+      totalCustomFactories: customFactoryVendors.length,
+      totalCombined: allVendors.length,
+      sampleVendors: allVendors.slice(0, 5)
+    });
+    
+    res.json(allVendors);
+  } catch (error) {
+    console.error('Error fetching vendor places:', error);
+    res.status(500).json({ error: 'Failed to fetch vendor places' });
+  }
 });
 
-// Get all trucks
-app.get('/api/trucks', (req, res) => {
-  const wb = loadWorkbook();
-  const ws = wb.Sheets['truck_details'];
-  if (!ws) return res.status(404).json({ error: 'truck_details worksheet not found' });
-  const trucks = XLSX.utils.sheet_to_json(ws);
-  res.json(trucks);
-});
-
-// Add new truck
-app.post('/api/trucks', (req, res) => {
-  const wb = loadWorkbook();
-  const ws = wb.Sheets['truck_details'];
-  let trucks = XLSX.utils.sheet_to_json(ws);
-  const newTruck = req.body;
-  newTruck.id = trucks.length ? Math.max(...trucks.map(t => Number(t.id))) + 1 : 1;
-  trucks.push(newTruck);
-  const newWs = XLSX.utils.json_to_sheet(trucks, { header: Object.keys(newTruck) });
-  wb.Sheets['truck_details'] = newWs;
-  saveWorkbook(wb);
-  res.json(trucks);
-});
-
-// Edit truck
-app.put('/api/trucks/:id', (req, res) => {
-  const wb = loadWorkbook();
-  const ws = wb.Sheets['truck_details'];
-  let trucks = XLSX.utils.sheet_to_json(ws);
-  const idx = trucks.findIndex(t => String(t.id) === String(req.params.id));
-  if (idx === -1) return res.status(404).json({ error: 'Truck not found' });
-  trucks[idx] = { ...trucks[idx], ...req.body, id: trucks[idx].id };
-  const newWs = XLSX.utils.json_to_sheet(trucks, { header: Object.keys(trucks[0]) });
-  wb.Sheets['truck_details'] = newWs;
-  saveWorkbook(wb);
-  res.json(trucks);
-});
-
-// Delete truck
-app.delete('/api/trucks/:id', (req, res) => {
-  const wb = loadWorkbook();
-  const ws = wb.Sheets['truck_details'];
-  let trucks = XLSX.utils.sheet_to_json(ws);
-  const idx = trucks.findIndex(t => String(t.id) === String(req.params.id));
-  if (idx === -1) return res.status(404).json({ error: 'Truck not found' });
-  trucks.splice(idx, 1);
-  const newWs = XLSX.utils.json_to_sheet(trucks, { header: Object.keys(trucks[0] || { id: '', vehicle_number: '', type: '', capacity_kg: '', vehicle_type: '', vendor_vehicle: '', is_rented: '', is_busy: '', current_order: '' }) });
-  wb.Sheets['truck_details'] = newWs;
-  saveWorkbook(wb);
-  res.json(trucks);
-});
-
-// Get all vendor places
-app.get('/api/vendor-places', (req, res) => {
-  const wb = loadWorkbook();
-  const ws = wb.Sheets['vendor_places'];
-  if (!ws) return res.status(404).json({ error: 'vendor_places worksheet not found' });
-  const places = XLSX.utils.sheet_to_json(ws);
-  res.json(places);
+// Debug endpoint to see all columns in vendor_places
+app.get('/api/vendor-places/debug', (req, res) => {
+  try {
+    const wb = loadWorkbook();
+    const ws = wb.Sheets['vendor_places'];
+    if (!ws) return res.status(404).json({ error: 'vendor_places worksheet not found' });
+    
+    const data = XLSX.utils.sheet_to_json(ws, { header: 1 });
+    if (!data || data.length < 1) {
+      return res.status(404).json({ error: 'No data found in vendor_places worksheet' });
+    }
+    
+    const headerRow = data[0];
+    const firstDataRow = data[1];
+    
+    res.json({
+      headers: headerRow,
+      firstRow: firstDataRow,
+      totalRows: data.length,
+      totalColumns: headerRow.length
+    });
+  } catch (error) {
+    console.error('Error reading vendor_places debug:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 // Add new vendor
@@ -504,6 +627,399 @@ app.delete('/api/vendor-places/:id', (req, res) => {
   wb.Sheets['vendor_places'] = newWs;
   saveWorkbook(wb);
   res.json(vendors);
+});
+
+// Get available sheets in Excel file
+app.get('/api/sheets', (req, res) => {
+  try {
+    const wb = loadWorkbook();
+    res.json({ sheets: wb.SheetNames });
+  } catch (error) {
+    console.error('Error reading Excel file:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Debug endpoint to inspect all sheets in Excel
+app.get('/api/debug/excel-sheets', (req, res) => {
+  try {
+    const wb = loadWorkbook();
+    const sheetNames = Object.keys(wb.Sheets);
+    
+    const sheetInfo = {};
+    for (const sheetName of sheetNames) {
+      const ws = wb.Sheets[sheetName];
+      const data = XLSX.utils.sheet_to_json(ws, { header: 1 });
+      if (data && data.length > 0) {
+        sheetInfo[sheetName] = {
+          headerRow: data[0],
+          totalRows: data.length,
+          sampleData: data.slice(1, 3) // First 2 data rows
+        };
+      }
+    }
+    
+    res.json({
+      availableSheets: sheetNames,
+      sheetInfo
+    });
+  } catch (error) {
+    console.error('Error debugging Excel sheets:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Debug endpoint to inspect vendor_places structure with comprehensive analysis
+app.get('/api/debug/vendor-places', (req, res) => {
+  try {
+    const wb = loadWorkbook();
+    const ws = wb.Sheets['vendor_places'];
+    if (!ws) {
+      return res.status(404).json({ error: 'vendor_places worksheet not found' });
+    }
+
+    const data = XLSX.utils.sheet_to_json(ws, { header: 1 });
+    if (!data || data.length < 2) {
+      return res.status(404).json({ error: 'No data found in vendor_places worksheet' });
+    }
+
+    const headerRow = data[0];
+    const firstDataRow = data[1];
+    
+    // Helper function to find column index with robust matching
+    const findColumnIndex = (targetColumn, headerRow) => {
+      // Try exact match first
+      let index = headerRow.findIndex(col => col === targetColumn);
+      if (index !== -1) return { index, method: 'exact', found: true };
+      
+      // Try case-insensitive match
+      index = headerRow.findIndex(col => 
+        col && typeof col === 'string' && col.toLowerCase().trim() === targetColumn.toLowerCase().trim()
+      );
+      if (index !== -1) return { index, method: 'case-insensitive', found: true };
+      
+      // Try partial match (in case there are extra spaces or characters)
+      index = headerRow.findIndex(col => 
+        col && typeof col === 'string' && col.toLowerCase().includes(targetColumn.toLowerCase())
+      );
+      if (index !== -1) return { index, method: 'partial', found: true };
+      
+      // Try reverse partial match (target contains column)
+      index = headerRow.findIndex(col => 
+        col && typeof col === 'string' && targetColumn.toLowerCase().includes(col.toLowerCase())
+      );
+      if (index !== -1) return { index, method: 'reverse-partial', found: true };
+      
+      return { index: -1, method: 'not-found', found: false };
+    };
+    
+    // Check for expected rate columns with robust matching
+    const expectedColumns = ['Drop 03', 'Pick 03', 'Drop 36', 'Pick 36', 'Drop 60', 'Pick 60', 'Toll charges'];
+    const columnAnalysis = expectedColumns.map(col => {
+      const result = findColumnIndex(col, headerRow);
+      return {
+        expectedColumn: col,
+        found: result.found,
+        method: result.method,
+        actualColumn: result.found ? headerRow[result.index] : null,
+        index: result.index
+      };
+    });
+    
+    const foundColumns = columnAnalysis.filter(col => col.found);
+    const missingColumns = columnAnalysis.filter(col => !col.found);
+    
+    // Find any similar columns for debugging
+    const similarDropColumns = headerRow.filter(col => 
+      col && typeof col === 'string' && col.toLowerCase().includes('drop')
+    );
+    const similarPickColumns = headerRow.filter(col => 
+      col && typeof col === 'string' && col.toLowerCase().includes('pick')
+    );
+    const similarTollColumns = headerRow.filter(col => 
+      col && typeof col === 'string' && col.toLowerCase().includes('toll')
+    );
+    
+    // Additional debugging: Check if there are any hidden characters or encoding issues
+    const columnAnalysisWithDetails = headerRow.map((col, index) => {
+      const colStr = col ? String(col) : '';
+      return {
+        index,
+        column: col,
+        trimmed: colStr.trim(),
+        length: colStr.length,
+        charCodes: colStr.split('').map(char => char.charCodeAt(0)),
+        containsDrop: colStr.toLowerCase().includes('drop'),
+        containsPick: colStr.toLowerCase().includes('pick'),
+        containsToll: colStr.toLowerCase().includes('toll'),
+        contains03: colStr.includes('03'),
+        contains36: colStr.includes('36'),
+        contains60: colStr.includes('60')
+      };
+    });
+
+    res.json({
+      headerRow,
+      firstDataRow,
+      totalRows: data.length,
+      availableColumns: headerRow,
+      sampleVendor: firstDataRow[0],
+      expectedColumns,
+      columnAnalysis,
+      foundColumns,
+      missingColumns,
+      similarDropColumns,
+      similarPickColumns,
+      similarTollColumns,
+      columnDetails: columnAnalysisWithDetails,
+      // Show first few rows for better debugging
+      sampleRows: data.slice(0, 5).map((row, index) => ({
+        rowIndex: index,
+        data: row,
+        vendorName: row[0]
+      }))
+    });
+  } catch (error) {
+    console.error('Error debugging vendor_places:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get vendor rates based on weight and shipping type
+app.post('/api/vendor-rates', (req, res) => {
+  const { vendorName, weight, isShippedByVendor } = req.body;
+  
+  console.log('=== VENDOR RATES DEBUG ===');
+  console.log('Request body:', { vendorName, weight, isShippedByVendor });
+  
+  // Validate required parameters
+  if (!vendorName || vendorName.trim() === '') {
+    console.log('Validation failed: vendorName is missing or empty');
+    return res.status(400).json({ error: 'Valid vendor name required' });
+  }
+  
+  if (!weight || isNaN(parseFloat(weight)) || parseFloat(weight) <= 0) {
+    console.log('Validation failed: weight is missing, invalid, or <= 0', { weight, type: typeof weight });
+    return res.status(400).json({ error: 'Valid weight required (must be a positive number)' });
+  }
+  
+  // Ensure isShippedByVendor is a boolean
+  const isShippedByVendorBoolean = Boolean(isShippedByVendor);
+  
+  console.log('Validation passed:', { vendorName, weight: parseFloat(weight), isShippedByVendor: isShippedByVendorBoolean });
+
+  try {
+    const wb = loadWorkbook();
+    const ws = wb.Sheets['vendor_places'];
+    if (!ws) {
+      console.log('vendor_places worksheet not found');
+      return res.status(404).json({ error: 'vendor_places worksheet not found' });
+    }
+
+    const data = XLSX.utils.sheet_to_json(ws, { header: 1 });
+    console.log('Excel data loaded, rows:', data.length);
+    console.log('Header row:', data[0]);
+    
+    if (!data || data.length < 2) {
+      console.log('No data found in vendor_places worksheet');
+      return res.status(404).json({ error: 'No data found in vendor_places worksheet' });
+    }
+
+    const headerRow = data[0];
+    console.log('Looking for vendor:', vendorName);
+    console.log('Available vendors (second column):', data.slice(1).map(row => row[1]).filter(Boolean));
+    
+    const vendorRow = data.find(row => row[1] === vendorName);
+    
+    if (!vendorRow) {
+      console.log('Vendor not found:', vendorName);
+      return res.status(404).json({ error: 'Vendor not found in vendor_places table' });
+    }
+    
+    console.log('Found vendor row:', vendorRow);
+
+    // Parse weight as float for calculations
+    const weightValue = parseFloat(weight);
+    
+    // Determine the correct rate column based on weight and shipping type
+    let rateColumn = '';
+    if (weightValue < 3000) {
+      rateColumn = isShippedByVendorBoolean ? 'Drop 03' : 'Pick 03';
+    } else if (weightValue >= 3000 && weightValue < 6000) {
+      rateColumn = isShippedByVendorBoolean ? 'Drop 36' : 'Pick 36';
+    } else {
+      rateColumn = isShippedByVendorBoolean ? 'Drop 60' : 'Pick 60';
+    }
+    
+    console.log('Weight category:', weightValue < 3000 ? 'Below 3000' : weightValue >= 3000 && weightValue < 6000 ? '3000-6000' : 'Above 6000');
+    console.log('Shipping type:', isShippedByVendorBoolean ? 'Shipped by vendor' : 'Not shipped by vendor');
+    console.log('Selected rate column:', rateColumn);
+
+    // Helper function to find column index with robust matching
+    const findColumnIndex = (targetColumn, headerRow) => {
+      // Try exact match first
+      let index = headerRow.findIndex(col => col === targetColumn);
+      if (index !== -1) return { index, method: 'exact', found: true };
+      
+      // Try case-insensitive match
+      index = headerRow.findIndex(col => 
+        col && typeof col === 'string' && col.toLowerCase().trim() === targetColumn.toLowerCase().trim()
+      );
+      if (index !== -1) return { index, method: 'case-insensitive', found: true };
+      
+      // Try partial match (in case there are extra spaces or characters)
+      index = headerRow.findIndex(col => 
+        col && typeof col === 'string' && col.toLowerCase().includes(targetColumn.toLowerCase())
+      );
+      if (index !== -1) return { index, method: 'partial', found: true };
+      
+      // Try reverse partial match (target contains column)
+      index = headerRow.findIndex(col => 
+        col && typeof col === 'string' && targetColumn.toLowerCase().includes(col.toLowerCase())
+      );
+      if (index !== -1) return { index, method: 'reverse-partial', found: true };
+      
+      // Try common variations and abbreviations
+      const variations = {
+        'Drop 03': ['Drop03', 'Drop 0-3', 'Drop 0 to 3', 'Drop 0-3000', 'Drop 0 to 3000', 'Drop 0-3 tons', 'Drop 0 to 3 tons'],
+        'Pick 03': ['Pick03', 'Pick 0-3', 'Pick 0 to 3', 'Pick 0-3000', 'Pick 0 to 3000', 'Pick 0-3 tons', 'Pick 0 to 3 tons'],
+        'Drop 36': ['Drop36', 'Drop 3-6', 'Drop 3 to 6', 'Drop 3000-6000', 'Drop 3000 to 6000', 'Drop 3-6 tons', 'Drop 3 to 6 tons'],
+        'Pick 36': ['Pick36', 'Pick 3-6', 'Pick 3 to 6', 'Pick 3000-6000', 'Pick 3000 to 6000', 'Pick 3-6 tons', 'Pick 3 to 6 tons'],
+        'Drop 60': ['Drop60', 'Drop 6+', 'Drop 6 and above', 'Drop 6000+', 'Drop above 6000', 'Drop above 6 tons'],
+        'Pick 60': ['Pick60', 'Pick 6+', 'Pick 6 and above', 'Pick 6000+', 'Pick above 6000', 'Pick above 6 tons'],
+        'Toll charges': ['Toll', 'Toll Charges', 'Toll charges', 'Toll_charges', 'TollCharges', 'Toll charges (Rs)', 'Toll Charges (Rs)']
+      };
+      
+      const variationsForTarget = variations[targetColumn] || [];
+      for (const variation of variationsForTarget) {
+        index = headerRow.findIndex(col => 
+          col && typeof col === 'string' && col.toLowerCase().trim() === variation.toLowerCase().trim()
+        );
+        if (index !== -1) return { index, method: `variation: ${variation}`, found: true };
+      }
+      
+      return { index: -1, method: 'not-found', found: false };
+    };
+
+    // Find the rate column index with robust matching
+    const rateColumnResult = findColumnIndex(rateColumn, headerRow);
+    console.log('Rate column result:', rateColumnResult);
+    console.log('Looking for rate column:', rateColumn);
+    console.log('Available columns:', headerRow);
+    
+    if (!rateColumnResult.found) {
+      console.log('Rate column not found:', rateColumn);
+      console.log('Available columns in vendor_places sheet:', headerRow);
+      
+      // Try to find any similar columns for debugging
+      const similarColumns = headerRow.filter(col => 
+        col && typeof col === 'string' && 
+        (col.toLowerCase().includes('drop') || col.toLowerCase().includes('pick'))
+      );
+      console.log('Similar columns found:', similarColumns);
+      
+      return res.status(404).json({ 
+        error: `Rate column '${rateColumn}' not found`,
+        allowManualEntry: true,
+        message: `Auto-population not available: The Excel file's vendor_places sheet is missing the required rate columns (Drop 03, Pick 03, Drop 36, Pick 36, Drop 60, Pick 60, Toll charges). Please add these columns to the vendor_places sheet or enter the invoice amount manually.`
+      });
+    }
+
+    const rateColumnIndex = rateColumnResult.index;
+    console.log('Rate column found at index:', rateColumnIndex, 'using method:', rateColumnResult.method);
+
+    // Find the toll charges column index with robust matching
+    const tollColumnResult = findColumnIndex('Toll charges', headerRow);
+    console.log('Toll charges column result:', tollColumnResult);
+    console.log('Looking for toll charges column: Toll charges');
+    
+    if (!tollColumnResult.found) {
+      console.log('Toll charges column not found');
+      console.log('Available columns in vendor_places sheet:', headerRow);
+      
+      // Try to find any similar columns for debugging
+      const similarColumns = headerRow.filter(col => 
+        col && typeof col === 'string' && 
+        col.toLowerCase().includes('toll')
+      );
+      console.log('Similar toll columns found:', similarColumns);
+      
+      return res.status(404).json({ 
+        error: 'Toll charges column not found',
+        allowManualEntry: true,
+        message: 'Auto-population not available: The Excel file\'s vendor_places sheet is missing the required "Toll charges" column. Please add this column to the vendor_places sheet or enter the toll charges manually.'
+      });
+    }
+
+    const tollColumnIndex = tollColumnResult.index;
+    console.log('Toll charges column found at index:', tollColumnIndex, 'using method:', tollColumnResult.method);
+
+    // Get the rate and toll values from the vendor row
+    const rateValue = vendorRow[rateColumnIndex];
+    const tollValue = vendorRow[tollColumnIndex];
+    
+    console.log('Rate value from Excel:', rateValue, 'Type:', typeof rateValue);
+    console.log('Toll value from Excel:', tollValue, 'Type:', typeof tollValue);
+
+    // Parse the rate value
+    let rate = 0;
+    if (rateValue !== undefined && rateValue !== null && rateValue !== '') {
+      rate = parseFloat(rateValue);
+      console.log('Parsed rate:', rate);
+      if (isNaN(rate)) {
+        console.log('Invalid rate value:', rateValue);
+        return res.status(404).json({ 
+          error: 'Invalid rate value in Excel',
+          allowManualEntry: true,
+          message: 'Auto-population not available: Invalid rate value found in the Excel file. Please enter the invoice amount manually.'
+        });
+      }
+    } else {
+      // Rate is blank/empty, meaning trip is not agreed with vendor
+      console.log('Rate is blank/empty');
+      return res.status(404).json({ 
+        error: 'Rate not available for this vendor and weight category',
+        allowManualEntry: true,
+        message: 'Auto-population not available: No rate agreement found for this vendor and weight category. Please enter the invoice amount manually.'
+      });
+    }
+
+    // Parse the toll charges value
+    let tollCharges = 0;
+    if (tollValue !== undefined && tollValue !== null && tollValue !== '') {
+      tollCharges = parseFloat(tollValue);
+      console.log('Parsed toll charges:', tollCharges);
+      if (isNaN(tollCharges)) {
+        tollCharges = 0; // Default to 0 if invalid
+        console.log('Invalid toll charges, defaulting to 0');
+      }
+    } else {
+      console.log('Toll charges is blank/empty, defaulting to 0');
+    }
+
+    // Calculate total amount (rate + toll charges)
+    const totalAmount = rate + tollCharges;
+    console.log('Calculated total amount:', totalAmount);
+
+    const response = {
+      rate,
+      tollCharges,
+      totalAmount,
+      vendorName,
+      weight,
+      isShippedByVendor: isShippedByVendorBoolean,
+      allowManualEntry: false
+    };
+    
+    console.log('Sending response:', response);
+    console.log('=== END VENDOR RATES DEBUG ===');
+
+    res.json(response);
+
+  } catch (error) {
+    console.error('Error calculating vendor rates:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 // Get truck suggestions based on weight and utilization requirements
@@ -652,6 +1168,65 @@ app.post('/api/trucks/suggest-wastage', (req, res) => {
   suggestions.sort((a, b) => a.capacity_diff - b.capacity_diff);
   
   res.json({ suggestions: suggestions.slice(0, 5) }); // Return top 5 suggestions
+});
+
+// Suggest truck combinations
+app.post('/api/trucks/suggest-combination', (req, res) => {
+  const { weight, weight_unit, min_utilization = 70, max_utilization = 100 } = req.body;
+  if (!weight || isNaN(weight)) {
+    return res.status(400).json({ error: 'Valid weight required' });
+  }
+
+  const wb = loadWorkbook();
+  const ws = wb.Sheets['truck_details'];
+  const trucks = XLSX.utils.sheet_to_json(ws);
+
+  // Get available trucks
+  const availableTrucks = trucks.filter(truck => !truck.is_busy);
+
+  // Generate combinations of 2 trucks
+  const combinations = [];
+  for (let i = 0; i < availableTrucks.length; i++) {
+    for (let j = i + 1; j < availableTrucks.length; j++) {
+      const truck1 = availableTrucks[i];
+      const truck2 = availableTrucks[j];
+      const totalCapacity = truck1.capacity_kg + truck2.capacity_kg;
+      const utilization = Math.round((weight / totalCapacity) * 100);
+
+      if (utilization >= min_utilization && utilization <= max_utilization) {
+        combinations.push({
+          trucks: [truck1, truck2],
+          totalCapacity,
+          utilization,
+          vehicle_numbers: [truck1.vehicle_number, truck2.vehicle_number],
+          capacities: [truck1.capacity_kg, truck2.capacity_kg],
+          vehicle_types: [truck1.vehicle_type, truck2.vehicle_type],
+          vendor_vehicles: [truck1.vendor_vehicle, truck2.vendor_vehicle],
+          is_rented: [truck1.is_rented, truck2.is_rented],
+          ids: [truck1.id, truck2.id]
+        });
+      }
+    }
+  }
+
+  // Sort by utilization (highest first)
+  combinations.sort((a, b) => b.utilization - a.utilization);
+
+  const suggestions = combinations.slice(0, 10).map(combo => ({
+    vehicle_number: combo.vehicle_numbers.join(' + '),
+    capacity_kg: combo.totalCapacity,
+    vehicle_type: combo.vehicle_types.join(' + '),
+    vendor_vehicle: combo.vendor_vehicles.join(' + '),
+    is_rented: combo.is_rented.some(r => r),
+    utilization: combo.utilization,
+    total_utilization: combo.utilization,
+    utilization_percentage: combo.utilization,
+    is_combination: true,
+    trucks: combo.trucks,
+    ids: combo.ids
+  }));
+
+  res.json({ suggestions });
 });
 
 // Helper to get all combinations of n trucks
@@ -975,8 +1550,9 @@ app.post('/api/orders/:id/revoke-reject', (req, res) => {
 
 // Get pending approvals for a user (notifications)
 app.get('/api/notifications', (req, res) => {
-  const { user_id } = req.query;
-  if (!user_id) return res.status(400).json({ error: 'user_id required' });
+  // For now, return empty notifications since we don't have token-based user extraction
+  // TODO: Implement proper token-based authentication
+  res.json([]);
   
   const wb = loadWorkbook();
   const ws = wb.Sheets['order_details'];
@@ -1044,6 +1620,57 @@ app.get('/api/notifications', (req, res) => {
   }
   
   res.json(notifications);
+});
+
+// Get all trucks
+app.get('/api/trucks', (req, res) => {
+  const wb = loadWorkbook();
+  const ws = wb.Sheets['truck_details'];
+  if (!ws) return res.status(404).json({ error: 'truck_details worksheet not found' });
+  const trucks = XLSX.utils.sheet_to_json(ws);
+  res.json(trucks);
+});
+
+// Add new truck
+app.post('/api/trucks', (req, res) => {
+  const wb = loadWorkbook();
+  const ws = wb.Sheets['truck_details'];
+  let trucks = XLSX.utils.sheet_to_json(ws);
+  const newTruck = req.body;
+  newTruck.id = trucks.length ? Math.max(...trucks.map(t => Number(t.id))) + 1 : 1;
+  trucks.push(newTruck);
+  const newWs = XLSX.utils.json_to_sheet(trucks, { header: Object.keys(newTruck) });
+  wb.Sheets['truck_details'] = newWs;
+  saveWorkbook(wb);
+  res.json(trucks);
+});
+
+// Edit truck
+app.put('/api/trucks/:id', (req, res) => {
+  const wb = loadWorkbook();
+  const ws = wb.Sheets['truck_details'];
+  let trucks = XLSX.utils.sheet_to_json(ws);
+  const idx = trucks.findIndex(t => String(t.id) === String(req.params.id));
+  if (idx === -1) return res.status(404).json({ error: 'Truck not found' });
+  trucks[idx] = { ...trucks[idx], ...req.body, id: trucks[idx].id };
+  const newWs = XLSX.utils.json_to_sheet(trucks, { header: Object.keys(trucks[0]) });
+  wb.Sheets['truck_details'] = newWs;
+  saveWorkbook(wb);
+  res.json(trucks);
+});
+
+// Delete truck
+app.delete('/api/trucks/:id', (req, res) => {
+  const wb = loadWorkbook();
+  const ws = wb.Sheets['truck_details'];
+  let trucks = XLSX.utils.sheet_to_json(ws);
+  const idx = trucks.findIndex(t => String(t.id) === String(req.params.id));
+  if (idx === -1) return res.status(404).json({ error: 'Truck not found' });
+  trucks.splice(idx, 1);
+  const newWs = XLSX.utils.json_to_sheet(trucks, { header: Object.keys(trucks[0] || { id: '', vehicle_number: '', type: '', capacity_kg: '', vehicle_type: '', vendor_vehicle: '', is_rented: '', is_busy: '', current_order: '' }) });
+  wb.Sheets['truck_details'] = newWs;
+  saveWorkbook(wb);
+  res.json(trucks);
 });
 
 const PORT = 4000;
